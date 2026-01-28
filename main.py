@@ -8,6 +8,8 @@ import json
 from google import genai
 from google.genai import types
 
+LOOKOUT_LIST = []
+
 
 def daily_port_analysis(portfolio: cl.Portfolio, client):
     prompt = f"""You are an AI portfolio trading manager for a cash-only account.
@@ -123,9 +125,7 @@ def daily_market_analysis(client):
     return json.loads(response.text)
 
 
-def add_market_analysis_stock(
-    portfolio: cl.Portfolio, analysis_json: str | dict | None
-) -> cl.Stock | None:
+def add_market_analysis_stock(analysis_json: str | dict | None) -> cl.Stock | None:
     if analysis_json is None:
         return None
 
@@ -179,12 +179,43 @@ def add_market_analysis_stock(
         take_profits=take_profits,
         state="watch",
     )
-    portfolio.stocks.append(stock)
     return stock
 
 
-RUN_TIMES = ["10:00", "14:30"]  # local time; edit this list to change runs per day
+RUN_TIMES = ["16:29", "16:32"]  # local time; edit this list to change runs per day
+SMALL_TASK_INTERVAL_MINUTES = 1  # change this to adjust the small task cadence
 # change this to us times maybe? as the alpaca only supports us stocks for some reason :/
+
+
+def _next_daily_run(now: datetime, run_times: list[str]) -> datetime:
+    today = now.date()
+    for t in run_times:
+        h, m = (int(x) for x in t.split(":"))
+        candidate = datetime.combine(today, datetime.min.time()) + timedelta(
+            hours=h, minutes=m
+        )
+        if candidate > now:
+            return candidate
+    h, m = (int(x) for x in run_times[0].split(":"))
+    return datetime.combine(today + timedelta(days=1), datetime.min.time()) + timedelta(
+        hours=h, minutes=m
+    )
+
+
+def _run_daily_tasks(portfolio: cl.Portfolio, client) -> None:
+    print("testing daily task")
+    # stockJson = daily_market_analysis(client)
+    # if stockJson is not None:
+    #     stock = add_market_analysis_stock(stockJson)
+    #     if stock is not None:
+    #         LOOKOUT_LIST.append(stock)
+    # cl.save_portfolio_to_json(portfolio, "data.json")
+
+
+def _run_small_tasks(portfolio: cl.Portfolio) -> None:
+    print("testing smaller task")
+    # add small, frequent tasks here
+    # cl.save_portfolio_to_json(portfolio, "data.json")
 
 
 def _main() -> None:
@@ -195,32 +226,23 @@ def _main() -> None:
     AIport = cl.Portfolio()
     run_times = sorted(RUN_TIMES)
 
-    # this is the daily run loop:
-
-    stockJson = daily_market_analysis(client)
-    if stockJson is not None:
-        add_market_analysis_stock(AIport, stockJson)
-    cl.save_portfolio_to_json(AIport, "data.json")
+    next_daily_run = _next_daily_run(datetime.now(), run_times)
+    next_small_run = datetime.now() + timedelta(minutes=SMALL_TASK_INTERVAL_MINUTES)
 
     while True:
         now = datetime.now()
-        today = now.date()
-        next_run = None
-        for t in run_times:
-            h, m = (int(x) for x in t.split(":"))
-            candidate = datetime.combine(today, datetime.min.time()) + timedelta(
-                hours=h, minutes=m
+        if now >= next_daily_run:
+            _run_daily_tasks(AIport, client)
+            next_daily_run = _next_daily_run(datetime.now(), run_times)
+
+        if now >= next_small_run:
+            _run_small_tasks(AIport)
+            next_small_run = datetime.now() + timedelta(
+                minutes=SMALL_TASK_INTERVAL_MINUTES
             )
-            if now < candidate:
-                next_run = candidate
-                break
-        if next_run is None:
-            h, m = (int(x) for x in run_times[0].split(":"))
-            next_run = datetime.combine(
-                today + timedelta(days=1), datetime.min.time()
-            ) + timedelta(hours=h, minutes=m)
-        time.sleep(max(0.0, (next_run - now).total_seconds()))
-        # this will run every x ammoung of time
+
+        next_wake = min(next_daily_run, next_small_run)
+        time.sleep(max(0.0, (next_wake - datetime.now()).total_seconds()))
 
 
 if __name__ == "__main__":
