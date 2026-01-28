@@ -1,0 +1,32 @@
+{
+  "value": null,
+  "cash": null,
+  "currency": "SEK",
+  "buy_orders": [],
+  "stocks": [
+    {
+      "symbol": "NVO",
+      "quantity": 2.3622047244094486,
+      "value": 150.0,
+      "current_price": null,
+      "current_price_timestamp": null,
+      "avg_buy_in_price": 63.5,
+      "buy_in_timestamp": "2026-01-28T16:19:20.024550",
+      "stop_loss": 56.9,
+      "take_profits": [
+        {
+          "p": 72.0,
+          "pct": 50.0
+        },
+        {
+          "p": 80.0,
+          "pct": 50.0
+        }
+      ],
+      "currency": null,
+      "isin": null,
+      "state": "watch"
+    }
+  ],
+  "funds": []
+}

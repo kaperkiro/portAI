@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field, asdict
 from typing import Optional, List, Literal
 import json
+import os
+import tempfile
 
 
 @dataclass
@@ -96,6 +98,7 @@ class Portfolio:
     cash: Optional[float] = None  # available cash
     currency: str = "SEK"
 
+    buy_orders: list[Stock] = field(default_factory=list)
     stocks: List[Stock] = field(default_factory=list)
     funds: List[Fund] = field(default_factory=list)
 
@@ -111,5 +114,18 @@ class Portfolio:
 
 
 def save_portfolio_to_json(portfolio: Portfolio, path: str = "data.json") -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(asdict(portfolio), f, indent=2)
+    data = asdict(portfolio)
+    directory = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".data.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
