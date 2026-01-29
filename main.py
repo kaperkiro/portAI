@@ -3,6 +3,7 @@ import os
 import classes as cl
 from datetime import datetime, timedelta
 import time
+import helpers as hp
 import yfinance as yf
 import json
 from google import genai
@@ -245,5 +246,24 @@ def _main() -> None:
         time.sleep(max(0.0, (next_wake - datetime.now()).total_seconds()))
 
 
+# AI helper tools:
+
+
+def get_current_ticker_data(ticker):
+    data = yf.Ticker(ticker)
+    info_filtered = hp.YFInfoFundamentals.from_yfinance_info(data.info).to_dict()
+    fast_filtered = hp.YFFastInfoSnapshot.from_yfinance_fast_info(
+        data.fast_info
+    ).to_dict()
+    earnings = hp.YFEarningsEvent.from_calendar_or_earnings_dates(
+        data.calendar, data.earnings_dates
+    ).to_dict()
+    actions = hp.YFCorporateActions.from_actions_dividends_splits(
+        data.actions_df, data.dividends_series, data.splits_series
+    ).to_dict()
+    analyst = hp.YFAnalystSignal.from_recommendations(data.recs_df).to_dict()
+
+
 if __name__ == "__main__":
-    _main()
+    # _main()
+    get_current_ticker_data("AMD")
