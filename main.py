@@ -1,15 +1,49 @@
 from dotenv import load_dotenv
 import os
 import classes as cl
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import time
 import helpers as hp
 import yfinance as yf
 import json
 from google import genai
+import re
 from google.genai import types
 
 LOOKOUT_LIST = []
+
+
+# AI helper tools:
+def get_current_ticker_data(ticker: str) -> str:
+    data = yf.Ticker(ticker)
+    print(f"Ran ticker data with ticker: {ticker}")
+    # implement some error handling
+    info_filtered = hp.YFInfoFundamentals.from_yfinance_info(data.info).to_dict()
+    fast_filtered = hp.YFFastInfoSnapshot.from_yfinance_fast_info(
+        data.fast_info
+    ).to_dict()
+    earnings = hp.YFEarningsEvent.from_calendar_or_earnings_dates(
+        data.calendar, data.earnings_dates
+    ).to_dict()
+    actions = hp.YFCorporateActions.from_actions_dividends_splits(
+        data.actions, data.dividends, data.splits
+    ).to_dict()
+    analyst = hp.YFAnalystSignal.from_recommendations(data.recommendations).to_dict()
+
+    price_targets = data.get_analyst_price_targets()
+
+    payload = hp.format_ticker_data_for_ai(
+        info_filtered, fast_filtered, earnings, actions, analyst, price_targets
+    )
+    ticker_line = f"ticker: {str(ticker).upper()}"
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    as_of_line = f"as_of: {timestamp}"
+    output = (
+        f"{ticker_line}\n{as_of_line}\n{payload}"
+        if payload
+        else f"{ticker_line}\n{as_of_line}"
+    )
+    return output
 
 
 def daily_port_analysis(portfolio: cl.Portfolio, client):
@@ -71,59 +105,195 @@ def daily_port_analysis(portfolio: cl.Portfolio, client):
     )
 
 
-def daily_market_analysis(client):
-    prompt = """
-    You are a professional portfolio manager + short-term swing trader (3–6 months). Your goal is to maximize income and value of a stock trading portfolio.
-    Your job: scan current market conditions and identify the single BEST stock opportunity right now (highest risk-adjusted edge). 
-    Use real analysis: catalyst/news, fundamentals (quick sanity check), sector/market regime, and technicals (trend, structure, volatility, liquidity). 
-    Do NOT invent prices. Use live/most recent data from tools provided by the environment. If you cannot verify current price/levels, output nothing.
-    If there are not any stock currently worth investing in, return the text nothing to invest in.  
+def _extract_tickers(text: str) -> list[str]:
+    """
+    Extract comma-separated tickers (best-effort). Accepts formats like:
+    'AAPL, MSFT, NVDA' or 'AAPL,MSFT,NVDA'
+    Returns a unique, ordered list.
+    """
+    if not text:
+        return []
+    if text.strip().lower() == "no opportunity":
+        return []
 
-    Universe: large/mega cap, highly liquid US/EU stocks (avoid microcaps, low volume, extreme spreads). Prefer tickers with clear catalysts and clean technical structure. Avoid earnings within 7 calendar days unless the trade is explicitly earnings-driven and risk is defined.
+    # Keep only plausible ticker tokens (1-6 letters, allow . for EU tickers like ASML.AS if it appears)
+    # But your step1 says uppercase only; we normalize anyway.
+    raw = [t.strip().upper() for t in text.split(",")]
+    tickers = []
+    seen = set()
+    for t in raw:
+        t = t.replace(" ", "")
+        if not t:
+            continue
+        # allow AAPL, MSFT, NVDA, and optionally BRK.B style, or ASML.AS style
+        if re.fullmatch(r"[A-Z]{1,6}([.\-][A-Z]{1,4})?", t):
+            if t not in seen:
+                seen.add(t)
+                tickers.append(t)
+    return tickers
+
+
+def daily_market_analysis(client):
+    # -----------------------
+    # STEP 1: Google Search ONLY
+    # -----------------------
+    prompt1 = """
+    You are a professional portfolio manager and short-term swing trader (3–6 months).
+
+    Task:
+    Scan current global equity markets using recent news and macro information.
+    Analyze:
+    - Market regime (risk-on / risk-off, rates, inflation, geopolitics)
+    - Sector rotation and relative strength
+    - Major catalysts (earnings trends, guidance, AI, energy, defense, healthcare, regulation)
+    - Liquidity and institutional relevance
+
+    Universe:
+    - Large and mega-cap EU equities only
+    - Highly liquid stocks (no microcaps, no thin volume)
+    - Avoid stocks with earnings within the next 7 calendar days unless the catalyst is earnings-driven
+
+    Objective:
+    Identify up to 5 of the most interesting stock tickers that may offer a high risk-adjusted swing trade opportunity over the next 30–180 days.
+
+    Rules:
+    - Do NOT invent prices or technical levels
+    - Do NOT propose entries, stops, or targets
+    - Do NOT call any functions
+    - Base conclusions only on recent, verifiable information
+
+    Output rules (IMPORTANT):
+    If NO stocks are interesting, output exactly:
+    no opportunity
+
+    If stocks ARE interesting, output EXACTLY in this 2-line format with no extra text:
+
+    MARKET_CONTEXT: <one short paragraph, max 60 words>
+    TICKERS: <comma-separated list of ticker symbols in uppercase>
+
+    Example:
+    MARKET_CONTEXT: Risk-on tone as rate fears ease; AI capex remains dominant; defensives lag; energy mixed; volatility moderate.
+    TICKERS: AAPL, MSFT, NVDA
+    """.strip()
+
+    grounding_tool = types.Tool(google_search=types.GoogleSearch())
+    config1 = types.GenerateContentConfig(
+        tools=[grounding_tool],
+        temperature=0.1,
+    )
+
+    resp1 = client.models.generate_content(
+        model="gemini-3-flash-preview",
+        contents=prompt1,
+        config=config1,
+    )
+
+    step1_text = (resp1.text or "").strip()
+    if step1_text.lower() == "no opportunity":
+        return "no opportunity"
+
+    # Parse Step 1 output
+    market_context = ""
+    tickers_line = ""
+
+    for line in step1_text.splitlines():
+        line = line.strip()
+        if line.upper().startswith("MARKET_CONTEXT:"):
+            market_context = line.split(":", 1)[1].strip()
+        elif line.upper().startswith("TICKERS:"):
+            tickers_line = line.split(":", 1)[1].strip()
+
+    # Fallback: if the model didn't follow format, assume entire output is tickers
+    if not tickers_line and "TICKERS:" not in step1_text.upper():
+        tickers_line = step1_text
+
+    tickers = _extract_tickers(tickers_line)
+    if not tickers:
+        return "no opportunity"
+
+    print(tickers)
+    # (Optional) hard cap at 5 to match your requirement
+    # tickers = tickers[:5]
+
+    # -----------------------
+    # STEP 2: Function calling ONLY (analyze ALL tickers, pick 1 best)
+    # -----------------------
+    # IMPORTANT: we pass market_context forward so step2 has continuity.
+    prompt2 = f"""
+    You are a professional portfolio manager and short-term swing trader (3–6 months).
+
+    Market context from the prior scan (use this to anchor regime/sector assumptions):
+    {market_context}
+
+    You will be given:
+    - A list of stock ticker symbols
+    - Access to the function get_current_ticker_data for live market data
+
+    Your goal:
+    Determine which ticker represents the SINGLE BEST risk-adjusted LONG opportunity right now (30–180 days), or output "no opportunity".
+
+    STRICT TOOL RULES (MANDATORY):
+    - You MUST call get_current_ticker_data at least once for EACH ticker in the list.
+    - If you cannot retrieve valid data for a ticker, discard it.
+    - Do NOT invent prices or levels.
+    - Use the retrieved current price and date in your final output.
+
+    Analysis requirements (internal reasoning only):
+    - Validate catalyst plausibility from market context + typical catalysts
+    - Sanity-check fundamentals at a high level (no deep modeling)
+    - Market/sector regime alignment
+    - Technical structure: trend + key structure + volatility logic (ATR/structure-based)
+    - Liquidity suitability for large/mega-cap swing trade
 
     Risk rules:
     - Provide a clear entry (buy_in_price) close to current price or a well-defined breakout/pullback trigger.
     - stop_loss must be a real invalidation level (structure/volatility-based), not arbitrary.
     - take_profit_1 and take_profit_2 must be realistic from ATR/structure and give favorable R:R (ideally TP2 >= 2R).
-    - Provide rationale in your own reasoning, but DO NOT output it unless asked.
+    - Only LONG ideas unless explicitly asked for shorts.
 
-    Output rules (IMPORTANT):
-    - If there is NO high-quality opportunity, output exactly: null
-    - If there IS an opportunity, output exactly one object in this schema (no extra keys, no comments, no markdown):
+    Output rules (CRITICAL):
+    - If NO high-quality opportunity exists after checking all tickers, output exactly:
+    no opportunity
 
-    Output the information like this:
+    - If there IS an opportunity, output EXACTLY one object with NO extra keys, NO comments, NO markdown:
 
-    "ticker": STRING,
+    {{
+    "ticker": "STRING",
     "current_price": INTEGER,
-    "current_price_date": STRING,
+    "current_price_date": "STRING",
     "order_time_horizon": INTEGER,
     "buy_in_price": NUMBER,
     "stop_loss": NUMBER,
     "take_profit_1": NUMBER,
     "take_profit_2": NUMBER,
-    "buy_in_ammount": INTEGER
-    
+    "buy_in_ammount": INTEGER,
+    "buy_motivation" : STRING,
+    "confidence" : INT FROM 1-10
+    }}
 
     Constraints:
-    - time_horizon_days is 30–180.
-    - buy in ammount is the ammount of currency to buy stocks for eg. 150 would be buy this stock for 150 of the currency is used in the portfolio.
-    - Prices must be consistent: stop_loss < buy_in_price < take_profit_1 < take_profit_2 for a long idea.
-    - Only output long ideas unless the user explicitly asks for shorts.
+    - order_time_horizon: 30–180
+    - buy_in_ammount: currency amount to allocate (e.g. 150)
+    - Prices must satisfy:
+    stop_loss < buy_in_price < take_profit_1 < take_profit_2
+    - The output must be ONLY the object or "no opportunity"
 
-    The output should only be the as the given example with the data filled in. No extra characters!
-    Now perform the scan and return the output."""
+    Tickers to analyze:
+    {", ".join(tickers)}
+    """.strip()
 
-    grounding_tool = types.Tool(google_search=types.GoogleSearch())
-
-    config = types.GenerateContentConfig(tools=[grounding_tool], temperature=0.1)
-
-    response = client.models.generate_content(
-        model="gemini-2.5-flash-preview-09-2025",
-        contents=prompt,
-        config=config,
+    config2 = types.GenerateContentConfig(
+        tools=[get_current_ticker_data],
+        temperature=0.1,
     )
-    print(response.text)
-    return json.loads(response.text)
+
+    resp2 = client.models.generate_content(
+        model="gemini-3-flash-preview",
+        contents=prompt2,
+        config=config2,
+    )
+
+    return (resp2.text or "").strip()
 
 
 def add_market_analysis_stock(analysis_json: str | dict | None) -> cl.Stock | None:
@@ -246,24 +416,10 @@ def _main() -> None:
         time.sleep(max(0.0, (next_wake - datetime.now()).total_seconds()))
 
 
-# AI helper tools:
-
-
-def get_current_ticker_data(ticker):
-    data = yf.Ticker(ticker)
-    info_filtered = hp.YFInfoFundamentals.from_yfinance_info(data.info).to_dict()
-    fast_filtered = hp.YFFastInfoSnapshot.from_yfinance_fast_info(
-        data.fast_info
-    ).to_dict()
-    earnings = hp.YFEarningsEvent.from_calendar_or_earnings_dates(
-        data.calendar, data.earnings_dates
-    ).to_dict()
-    actions = hp.YFCorporateActions.from_actions_dividends_splits(
-        data.actions_df, data.dividends_series, data.splits_series
-    ).to_dict()
-    analyst = hp.YFAnalystSignal.from_recommendations(data.recs_df).to_dict()
-
-
 if __name__ == "__main__":
     # _main()
-    get_current_ticker_data("AMD")
+    # cl.save_string_to_json(get_current_ticker_data("NVDA"))
+    load_dotenv()  # reads .env in current working dir
+    api_key = os.getenv("GEMINI_API_KEY")
+    client = genai.Client(api_key=api_key)
+    print(daily_market_analysis(client))

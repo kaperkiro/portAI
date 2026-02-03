@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field, asdict
 from typing import Optional, List, Literal
+import ast
 import json
+from typing import Any, Dict, Optional
 import os
 import tempfile
 
@@ -12,6 +14,16 @@ class TakeProfit:
 
     def to_dict(self) -> dict:
         return {"p": self.p, "pct": self.pct}
+
+
+@dataclass
+class TradingPlan:
+    # Plan (sell-only management)
+    stop_loss: Optional[float] = None
+    take_profits: List[TakeProfit] = field(
+        default_factory=list
+    )  # replaces level1/level2
+    last_updated_timestamp: str = None
 
 
 @dataclass
@@ -32,11 +44,8 @@ class Stock:
     avg_buy_in_price: Optional[float] = None
     buy_in_timestamp: Optional[str] = None  # ISO timestamp
 
-    # Plan (sell-only management)
-    stop_loss: Optional[float] = None
-    take_profits: List[TakeProfit] = field(
-        default_factory=list
-    )  # replaces level1/level2
+    # trading plan
+    trading_plan: TradingPlan = None
 
     # Minimal metadata (tiny tokens, big benefit)
     currency: Optional[str] = None  # e.g. "SEK", "USD"
@@ -120,6 +129,99 @@ def save_portfolio_to_json(portfolio: Portfolio, path: str = "data.json") -> Non
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def save_string_to_json(data: str, path: str = "data.json") -> None:
+    """
+    Save a string to a JSON file. If the string is valid JSON, store it as JSON;
+    otherwise store it under a "text" key for readability.
+    """
+
+    def _parse_scalar(val: str) -> Any:
+        if val == "":
+            return ""
+        lowered = val.lower()
+        if lowered in {"none", "null"}:
+            return None
+        if lowered in {"true", "false"}:
+            return lowered == "true"
+        # int first, then float
+        try:
+            if val.lstrip("+-").isdigit():
+                return int(val)
+        except Exception:
+            pass
+        try:
+            return float(val)
+        except Exception:
+            pass
+        # try JSON for objects/arrays
+        if (val.startswith("{") and val.endswith("}")) or (
+            val.startswith("[") and val.endswith("]")
+        ):
+            try:
+                return json.loads(val)
+            except Exception:
+                pass
+            try:
+                return ast.literal_eval(val)
+            except Exception:
+                pass
+        return val
+
+    def _parse_ai_text_to_json(text: str) -> Optional[Dict[str, Any]]:
+        lines = text.splitlines()
+        result: Dict[str, Any] = {}
+        current: Dict[str, Any] = result
+        has_any = False
+
+        for raw in lines:
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1].strip()
+                if not section:
+                    continue
+                result.setdefault(section, {})
+                current = result[section]
+                has_any = True
+                continue
+
+            if line.startswith("- "):
+                line = line[2:]
+            if ":" in line:
+                key, val = line.split(":", 1)
+                key = key.strip()
+                val = val.strip()
+                if not key:
+                    continue
+                current[key] = _parse_scalar(val)
+                has_any = True
+
+        return result if has_any else None
+
+    directory = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".data.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            payload = data
+            if isinstance(data, str):
+                try:
+                    payload = json.loads(data)
+                except json.JSONDecodeError:
+                    parsed = _parse_ai_text_to_json(data)
+                    payload = parsed if parsed is not None else {"text": data}
+            json.dump(payload, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, path)

@@ -1,32 +1,55 @@
 {
-  "value": null,
-  "cash": null,
-  "currency": "SEK",
-  "buy_orders": [],
-  "stocks": [
-    {
-      "symbol": "NVO",
-      "quantity": 2.3622047244094486,
-      "value": 150.0,
-      "current_price": null,
-      "current_price_timestamp": null,
-      "avg_buy_in_price": 63.5,
-      "buy_in_timestamp": "2026-01-28T16:19:20.024550",
-      "stop_loss": 56.9,
-      "take_profits": [
-        {
-          "p": 72.0,
-          "pct": 50.0
-        },
-        {
-          "p": 80.0,
-          "pct": 50.0
-        }
-      ],
-      "currency": null,
-      "isin": null,
-      "state": "watch"
+  "ticker": "NVDA",
+  "fundamentals": {
+    "sector": "Technology",
+    "industry": "Semiconductors",
+    "currency": "USD",
+    "market_cap": 4687040872448.0,
+    "beta": 2.314,
+    "average_volume": 181668703.0,
+    "trailing_pe": 47.65099,
+    "forward_pe": 25.119196,
+    "price_to_book": 39.352,
+    "profit_margins_pct": 53.007000000000005,
+    "operating_margins_pct": 63.168997000000005,
+    "gross_margins_pct": 70.05,
+    "revenue_growth_pct": 62.5,
+    "earnings_growth_pct": 66.7,
+    "fifty_two_week_high": 212.19,
+    "fifty_two_week_low": 86.62,
+    "trailing_eps": 4.04,
+    "forward_eps": 7.66386,
+    "dividend_yield_pct": 2.0,
+    "debt_to_equity": 9.102
+  },
+  "price_context": {
+    "currency": "USD"
+  },
+  "earnings_event": {
+    "earnings_date_iso": "2026-02-25",
+    "earnings_in_days": 26
+  },
+  "corporate_actions": {
+    "last_split_date_iso": "2024-06-10",
+    "last_split_ratio": 10.0,
+    "last_dividend_date_iso": "2025-12-04",
+    "last_dividend_amount": 0.01
+  },
+  "analyst_signal": {
+    "trend_90d": "improving",
+    "rating_buckets": {
+      "strong_buy": 12.0,
+      "buy": 48.0,
+      "hold": 3.0,
+      "sell": 1.0,
+      "strong_sell": 0.0
     }
-  ],
-  "funds": []
+  },
+  "analyst_price_targets": {
+    "current": 192.51,
+    "high": 352.0,
+    "low": 140.0,
+    "mean": 253.19034,
+    "median": 250.0
+  }
 }

@@ -50,6 +50,44 @@ def _safe_str(x: Any) -> Optional[str]:
     return s if s else None
 
 
+def format_ticker_data_for_ai(
+    info_filtered: Dict[str, Any],
+    fast_filtered: Dict[str, Any],
+    earnings: Dict[str, Any],
+    actions: Dict[str, Any],
+    analyst: Dict[str, Any],
+    price_targets: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    Combine filtered ticker data into a single, AI-friendly string.
+    Skips fields with None values and empty sections.
+    """
+    sections = [
+        ("fundamentals", info_filtered),
+        ("price_context", fast_filtered),
+        ("earnings_event", earnings),
+        ("corporate_actions", actions),
+        ("analyst_signal", analyst),
+        ("analyst_price_targets", price_targets or {}),
+    ]
+
+    lines: List[str] = []
+    for title, data in sections:
+        if not isinstance(data, dict) or not data:
+            continue
+        section_lines = []
+        for key, value in data.items():
+            if value is None:
+                continue
+            section_lines.append(f"- {key}: {value}")
+        if not section_lines:
+            continue
+        lines.append(f"[{title}]")
+        lines.extend(section_lines)
+
+    return "\n".join(lines)
+
+
 # -----------------------------
 # 1) info (fundamentals snapshot)
 # -----------------------------
@@ -289,10 +327,10 @@ class YFCorporateActions:
 @dataclass(frozen=True)
 class YFAnalystSignal:
     # Very compact: last action + simple trend direction
-    latest_grade: Optional[str]
     latest_firm: Optional[str]
     latest_action_iso: Optional[str]
     trend_90d: Optional[str]  # "improving" | "deteriorating" | "mixed" | "unknown"
+    rating_buckets: Optional[Dict[str, Optional[float]]] = None
 
     @staticmethod
     def from_recommendations(
@@ -302,51 +340,157 @@ class YFAnalystSignal:
         yfinance recommendations can be noisy. We keep only a minimal summary.
         """
         if not isinstance(recommendations, pd.DataFrame) or recommendations.empty:
-            return YFAnalystSignal(None, None, None, "unknown")
+            return YFAnalystSignal(None, None, "unknown", None)
 
         df = recommendations.copy()
-        # Common cols: Firm, To Grade, From Grade, Action
-        # Index is datetime
-        try:
-            df.index = pd.to_datetime(df.index)
-            df = df.sort_index()
-        except Exception:
-            pass
 
-        latest = df.iloc[-1] if len(df) else None
-        latest_date_iso = None
-        try:
-            latest_date_iso = pd.to_datetime(df.index[-1]).date().isoformat()
-        except Exception:
-            pass
+        def _norm_col(name: Any) -> str:
+            return "".join(ch for ch in str(name).lower() if ch.isalnum())
 
-        latest_grade = _safe_str(latest.get("To Grade")) if latest is not None else None
-        latest_firm = _safe_str(latest.get("Firm")) if latest is not None else None
+        def _safe_val(val: Any) -> Optional[str]:
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                return None
+            s = str(val).strip()
+            if not s or s.lower() in {"nan", "none", "null"}:
+                return None
+            return s
 
-        # Trend in last 90 days: count upgrades vs downgrades if "Action" exists
-        trend = "unknown"
-        try:
-            cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=90)
-            recent = df[df.index >= cutoff]
-            if "Action" in recent.columns and not recent.empty:
-                actions = recent["Action"].astype(str).str.lower()
-                up = actions.str.contains("up").sum()
-                down = actions.str.contains("down").sum()
-                if up > down:
+        colmap = {_norm_col(c): c for c in df.columns}
+        has_upgrade_cols = any(
+            key in colmap for key in ("tograde", "fromgrade", "action", "firm")
+        )
+        has_trend_cols = any(
+            key in colmap
+            for key in ("strongbuy", "buy", "hold", "sell", "strongsell")
+        )
+
+        # --- Upgrade/Downgrade history style ---
+        if has_upgrade_cols:
+            dt_index = None
+            if isinstance(df.index, pd.DatetimeIndex):
+                dt_index = df.index
+            else:
+                for key in ("gradedate", "date", "datetime"):
+                    if key in colmap:
+                        dt_index = pd.to_datetime(df[colmap[key]], errors="coerce")
+                        break
+
+            if dt_index is not None:
+                df = df.copy()
+                df["_dt"] = dt_index
+                df = df.sort_values("_dt")
+                latest = df.iloc[-1] if len(df) else None
+                latest_date_iso = None
+                if latest is not None and pd.notna(latest.get("_dt")):
+                    latest_date_iso = pd.to_datetime(latest.get("_dt")).date().isoformat()
+                dt_series = df["_dt"]
+            else:
+                latest = df.iloc[-1] if len(df) else None
+                latest_date_iso = None
+                dt_series = None
+
+            grade_col = colmap.get("tograde")
+            firm_col = colmap.get("firm")
+            action_col = colmap.get("action")
+
+            latest_firm = (
+                _safe_val(latest.get(firm_col)) if latest is not None else None
+            )
+
+            trend = "unknown"
+            try:
+                if dt_series is not None and action_col is not None:
+                    cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=90)
+                    recent = df[dt_series >= cutoff]
+                    if not recent.empty:
+                        actions = recent[action_col].astype(str).str.lower()
+                        up = actions.str.contains("up").sum()
+                        down = actions.str.contains("down").sum()
+                        if up > down:
+                            trend = "improving"
+                        elif down > up:
+                            trend = "deteriorating"
+                        else:
+                            trend = "mixed"
+            except Exception:
+                trend = "unknown"
+
+            return YFAnalystSignal(
+                latest_firm=latest_firm,
+                latest_action_iso=latest_date_iso,
+                trend_90d=trend,
+                rating_buckets=None,
+            )
+
+        # --- Recommendation trend style (counts by period) ---
+        if has_trend_cols:
+            def _num(col_key: str, row: pd.Series) -> float:
+                col = colmap.get(col_key)
+                if col is None:
+                    return 0.0
+                return float(pd.to_numeric(row.get(col), errors="coerce") or 0.0)
+
+            period_col = colmap.get("period")
+            latest_row = None
+            if period_col and period_col in df.columns:
+                period_vals = df[period_col].astype(str)
+                match = df[period_vals == "0m"]
+                latest_row = match.iloc[0] if not match.empty else df.iloc[0]
+            else:
+                latest_row = df.iloc[0]
+
+            if latest_row is None:
+                return YFAnalystSignal(None, None, None, "unknown")
+
+            counts = {
+                "strong_buy": _num("strongbuy", latest_row),
+                "buy": _num("buy", latest_row),
+                "hold": _num("hold", latest_row),
+                "sell": _num("sell", latest_row),
+                "strong_sell": _num("strongsell", latest_row),
+            }
+            def _score(row: pd.Series) -> float:
+                return (
+                    _num("strongbuy", row) * 2.0
+                    + _num("buy", row) * 1.0
+                    + _num("hold", row) * 0.0
+                    + _num("sell", row) * -1.0
+                    + _num("strongsell", row) * -2.0
+                )
+
+            trend = "unknown"
+            try:
+                if period_col and period_col in df.columns:
+                    periods = df[period_col].astype(str)
+                    now_row = df[periods == "0m"]
+                    then_row = df[periods == "-3m"]
+                    if not now_row.empty and not then_row.empty:
+                        now_score = _score(now_row.iloc[0])
+                        then_score = _score(then_row.iloc[0])
+                    else:
+                        now_score = _score(df.iloc[0])
+                        then_score = _score(df.iloc[-1])
+                else:
+                    now_score = _score(df.iloc[0])
+                    then_score = _score(df.iloc[-1])
+
+                if now_score > then_score:
                     trend = "improving"
-                elif down > up:
+                elif now_score < then_score:
                     trend = "deteriorating"
                 else:
                     trend = "mixed"
-        except Exception:
-            trend = "unknown"
+            except Exception:
+                trend = "unknown"
 
-        return YFAnalystSignal(
-            latest_grade=latest_grade,
-            latest_firm=latest_firm,
-            latest_action_iso=latest_date_iso,
-            trend_90d=trend,
-        )
+            return YFAnalystSignal(
+                latest_firm=None,
+                latest_action_iso=None,
+                trend_90d=trend,
+                rating_buckets=counts,
+            )
+
+        return YFAnalystSignal(None, None, "unknown", None)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
