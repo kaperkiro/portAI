@@ -8,6 +8,11 @@ import tempfile
 
 
 @dataclass
+class AlpacaPortfolio:
+    pass
+
+
+@dataclass
 class TakeProfit:
     p: float  # price level
     pct: float = 100.0  # % of position to sell at this level (0-100)
