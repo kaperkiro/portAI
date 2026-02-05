@@ -1,55 +1,76 @@
 {
-  "ticker": "NVDA",
+  "ticker": "INVE-B.ST",
+  "as_of": "2026-02-05 14:12:08 UTC",
   "fundamentals": {
-    "sector": "Technology",
-    "industry": "Semiconductors",
-    "currency": "USD",
-    "market_cap": 4687040872448.0,
-    "beta": 2.314,
-    "average_volume": 181668703.0,
-    "trailing_pe": 47.65099,
-    "forward_pe": 25.119196,
-    "price_to_book": 39.352,
-    "profit_margins_pct": 53.007000000000005,
-    "operating_margins_pct": 63.168997000000005,
-    "gross_margins_pct": 70.05,
-    "revenue_growth_pct": 62.5,
-    "earnings_growth_pct": 66.7,
-    "fifty_two_week_high": 212.19,
-    "fifty_two_week_low": 86.62,
-    "trailing_eps": 4.04,
-    "forward_eps": 7.66386,
-    "dividend_yield_pct": 2.0,
-    "debt_to_equity": 9.102
+    "sector": "Financial Services",
+    "industry": "Asset Management",
+    "currency": "SEK",
+    "market_cap": 1086862000128.0,
+    "beta": 0.798,
+    "average_volume": 3511596.0,
+    "trailing_pe": 6.901381,
+    "forward_pe": 22.526983,
+    "price_to_book": 1.1396194,
+    "profit_margins_pct": 71.616995,
+    "operating_margins_pct": 80.193,
+    "gross_margins_pct": 84.622,
+    "fifty_two_week_high": 358.3,
+    "fifty_two_week_low": 247.0,
+    "trailing_eps": 51.41,
+    "forward_eps": 15.75,
+    "dividend_yield_pct": 157.0,
+    "debt_to_equity": 12.131
   },
   "price_context": {
-    "currency": "USD"
+    "currency": "SEK"
+  },
+  "price_history": {
+    "last_close": 354.8,
+    "atr_14": 6.63,
+    "atr_14_pct": 1.87,
+    "avg_volume_20d": 3751695,
+    "last_volume": 1477278,
+    "volume_ratio_vs_20d": 0.39,
+    "range_20d_high": 358.3,
+    "range_20d_low": 330.65,
+    "close_vs_20d_high_pct": -0.98,
+    "recent_bars_5d": "2026-01-30 C=343.20 V=2808954; 2026-02-02 C=348.90 V=3897832; 2026-02-03 C=352.70 V=3129346; 2026-02-04 C=356.75 V=4156161; 2026-02-05 C=354.80 V=1477278"
+  },
+  "nav_discount": {
+    "market_price": 354.8,
+    "price_source": "currentPrice"
+  },
+  "market_correlation": {
+    "index_ticker": "^OMX",
+    "correlation_1y": 0.91,
+    "beta_1y": 1.1,
+    "overlap_days": 249
   },
   "earnings_event": {
-    "earnings_date_iso": "2026-02-25",
-    "earnings_in_days": 26
+    "earnings_date_iso": "2026-07-16",
+    "earnings_in_days": 161
   },
   "corporate_actions": {
-    "last_split_date_iso": "2024-06-10",
-    "last_split_ratio": 10.0,
-    "last_dividend_date_iso": "2025-12-04",
-    "last_dividend_amount": 0.01
+    "last_split_date_iso": "2021-05-19",
+    "last_split_ratio": 4.0,
+    "last_dividend_date_iso": "2025-11-07",
+    "last_dividend_amount": 1.45
   },
   "analyst_signal": {
-    "trend_90d": "improving",
+    "trend_90d": "mixed",
     "rating_buckets": {
-      "strong_buy": 12.0,
-      "buy": 48.0,
-      "hold": 3.0,
+      "strong_buy": 0.0,
+      "buy": 3.0,
+      "hold": 2.0,
       "sell": 1.0,
       "strong_sell": 0.0
     }
   },
   "analyst_price_targets": {
-    "current": 192.51,
-    "high": 352.0,
-    "low": 140.0,
-    "mean": 253.19034,
-    "median": 250.0
+    "current": 354.8,
+    "high": 392.0,
+    "low": 300.0,
+    "mean": 360.4,
+    "median": 375.0
   }
 }

@@ -32,6 +32,13 @@ def _to_int(x: Any) -> Optional[int]:
         return None
 
 
+def _round_opt(x: Any, ndigits: int = 2) -> Optional[float]:
+    v = _to_float(x)
+    if v is None:
+        return None
+    return round(v, ndigits)
+
+
 def _pct_to_float(x: Any) -> Optional[float]:
     """
     yfinance commonly returns ratios as 0.12 for 12%.
@@ -57,6 +64,9 @@ def format_ticker_data_for_ai(
     actions: Dict[str, Any],
     analyst: Dict[str, Any],
     price_targets: Optional[Dict[str, Any]] = None,
+    price_history: Optional[Dict[str, Any]] = None,
+    nav_discount: Optional[Dict[str, Any]] = None,
+    market_correlation: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Combine filtered ticker data into a single, AI-friendly string.
@@ -65,6 +75,9 @@ def format_ticker_data_for_ai(
     sections = [
         ("fundamentals", info_filtered),
         ("price_context", fast_filtered),
+        ("price_history", price_history or {}),
+        ("nav_discount", nav_discount or {}),
+        ("market_correlation", market_correlation or {}),
         ("earnings_event", earnings),
         ("corporate_actions", actions),
         ("analyst_signal", analyst),
@@ -201,7 +214,326 @@ class YFFastInfoSnapshot:
 
 
 # -----------------------------
-# 3) earnings/events (calendar / earnings_dates)
+# 3) price history (volatility + volume context)
+# -----------------------------
+
+
+@dataclass(frozen=True)
+class YFPriceHistorySummary:
+    last_close: Optional[float]
+    atr_14: Optional[float]
+    atr_14_pct: Optional[float]
+    avg_volume_20d: Optional[int]
+    last_volume: Optional[int]
+    volume_ratio_vs_20d: Optional[float]
+    range_20d_high: Optional[float]
+    range_20d_low: Optional[float]
+    close_vs_20d_high_pct: Optional[float]
+    recent_bars_5d: Optional[str]
+
+    @staticmethod
+    def from_history(
+        history: Optional[pd.DataFrame],
+        *,
+        atr_period: int = 14,
+        volume_window: int = 20,
+        range_window: int = 20,
+        recent_bars: int = 5,
+    ) -> "YFPriceHistorySummary":
+        if not isinstance(history, pd.DataFrame) or history.empty:
+            return YFPriceHistorySummary(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+
+        df = history.copy()
+
+        def _col(name: str) -> Optional[str]:
+            if name in df.columns:
+                return name
+            lower_map = {c.lower(): c for c in df.columns}
+            return lower_map.get(name.lower())
+
+        close_col = _col("Close") or _col("Adj Close")
+        high_col = _col("High")
+        low_col = _col("Low")
+        volume_col = _col("Volume")
+
+        if close_col is None or high_col is None or low_col is None:
+            return YFPriceHistorySummary(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+
+        close = pd.to_numeric(df[close_col], errors="coerce")
+        high = pd.to_numeric(df[high_col], errors="coerce")
+        low = pd.to_numeric(df[low_col], errors="coerce")
+        volume = (
+            pd.to_numeric(df[volume_col], errors="coerce")
+            if volume_col is not None
+            else None
+        )
+
+        last_close = _round_opt(close.iloc[-1], 2) if not close.empty else None
+
+        atr_14 = None
+        atr_14_pct = None
+        try:
+            prev_close = close.shift(1)
+            tr = pd.concat(
+                [
+                    (high - low).abs(),
+                    (high - prev_close).abs(),
+                    (low - prev_close).abs(),
+                ],
+                axis=1,
+            ).max(axis=1)
+            atr_series = tr.rolling(atr_period, min_periods=atr_period).mean()
+            atr_14 = _round_opt(atr_series.iloc[-1], 2)
+            if last_close is not None and atr_14 is not None and last_close != 0:
+                atr_14_pct = _round_opt((atr_14 / last_close) * 100.0, 2)
+        except Exception:
+            atr_14 = None
+            atr_14_pct = None
+
+        avg_volume_20d = None
+        last_volume = None
+        volume_ratio = None
+        if volume is not None and not volume.empty:
+            try:
+                last_volume = _to_int(volume.iloc[-1])
+                avg_volume_20d = _to_int(volume.tail(volume_window).mean())
+                if (
+                    last_volume is not None
+                    and avg_volume_20d is not None
+                    and avg_volume_20d != 0
+                ):
+                    volume_ratio = _round_opt(last_volume / avg_volume_20d, 2)
+            except Exception:
+                last_volume = None
+                avg_volume_20d = None
+                volume_ratio = None
+
+        range_high = None
+        range_low = None
+        close_vs_high_pct = None
+        try:
+            range_high = _round_opt(high.tail(range_window).max(), 2)
+            range_low = _round_opt(low.tail(range_window).min(), 2)
+            if last_close is not None and range_high is not None and range_high != 0:
+                close_vs_high_pct = _round_opt(
+                    (last_close / range_high - 1.0) * 100.0, 2
+                )
+        except Exception:
+            range_high = None
+            range_low = None
+            close_vs_high_pct = None
+
+        recent_bars_str = None
+        try:
+            tail = df.tail(recent_bars)
+            parts = []
+            for idx, row in tail.iterrows():
+                try:
+                    dt = pd.to_datetime(idx).date().isoformat()
+                except Exception:
+                    dt = str(idx)
+                close_val = _to_float(row.get(close_col))
+                vol_val = _to_int(row.get(volume_col)) if volume_col else None
+                if close_val is None and vol_val is None:
+                    continue
+                close_part = f"C={close_val:.2f}" if close_val is not None else "C=?"
+                if vol_val is not None:
+                    vol_part = f"V={vol_val}"
+                    bar = f"{dt} {close_part} {vol_part}"
+                else:
+                    bar = f"{dt} {close_part}"
+                parts.append(bar)
+            recent_bars_str = "; ".join(parts) if parts else None
+        except Exception:
+            recent_bars_str = None
+
+        return YFPriceHistorySummary(
+            last_close=last_close,
+            atr_14=atr_14,
+            atr_14_pct=atr_14_pct,
+            avg_volume_20d=avg_volume_20d,
+            last_volume=last_volume,
+            volume_ratio_vs_20d=volume_ratio,
+            range_20d_high=range_high,
+            range_20d_low=range_low,
+            close_vs_20d_high_pct=close_vs_high_pct,
+            recent_bars_5d=recent_bars_str,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# -----------------------------
+# 4) NAV discount/premium (funds/holdcos when NAV is available)
+# -----------------------------
+
+
+@dataclass(frozen=True)
+class YFNavDiscountPremium:
+    nav_price: Optional[float]
+    market_price: Optional[float]
+    nav_discount_premium_pct: Optional[float]  # negative = discount, positive = premium
+    nav_source: Optional[str]
+    price_source: Optional[str]
+
+    @staticmethod
+    def from_yfinance_info(
+        info: Dict[str, Any],
+        fast_info: Optional[Dict[str, Any]] = None,
+    ) -> "YFNavDiscountPremium":
+        def _pick(
+            d: Dict[str, Any],
+            keys: List[str],
+        ) -> tuple[Optional[float], Optional[str]]:
+            for key in keys:
+                if key in d:
+                    val = _to_float(d.get(key))
+                    if val is not None:
+                        return val, key
+            return None, None
+
+        info = info or {}
+        fast_info = fast_info or {}
+
+        nav_keys = [
+            "navPrice",
+            "nav",
+            "netAssetValue",
+            "netAssetValuePerShare",
+            "netAssetValuePerShareTTM",
+        ]
+        price_keys_info = [
+            "currentPrice",
+            "regularMarketPrice",
+            "previousClose",
+        ]
+        price_keys_fast = [
+            "last_price",
+            "previous_close",
+        ]
+
+        nav_price, nav_source = _pick(info, nav_keys)
+        market_price, price_source = _pick(fast_info, price_keys_fast)
+        if market_price is None:
+            market_price, price_source = _pick(info, price_keys_info)
+
+        nav_discount_premium_pct = None
+        if nav_price is not None and market_price is not None and nav_price != 0:
+            nav_discount_premium_pct = _round_opt(
+                (market_price / nav_price - 1.0) * 100.0, 2
+            )
+
+        return YFNavDiscountPremium(
+            nav_price=nav_price,
+            market_price=market_price,
+            nav_discount_premium_pct=nav_discount_premium_pct,
+            nav_source=nav_source,
+            price_source=price_source,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# -----------------------------
+# 5) index correlation (beta-adjusted context)
+# -----------------------------
+
+
+@dataclass(frozen=True)
+class YFMarketCorrelation:
+    index_ticker: Optional[str]
+    correlation_1y: Optional[float]
+    beta_1y: Optional[float]
+    overlap_days: Optional[int]
+
+    @staticmethod
+    def from_histories(
+        stock_history: Optional[pd.DataFrame],
+        index_history: Optional[pd.DataFrame],
+        *,
+        index_ticker: str,
+        window_days: int = 252,
+    ) -> "YFMarketCorrelation":
+        if (
+            not isinstance(stock_history, pd.DataFrame)
+            or stock_history.empty
+            or not isinstance(index_history, pd.DataFrame)
+            or index_history.empty
+        ):
+            return YFMarketCorrelation(index_ticker, None, None, None)
+
+        def _get_close(df: pd.DataFrame) -> pd.Series:
+            if "Adj Close" in df.columns:
+                return pd.to_numeric(df["Adj Close"], errors="coerce")
+            if "Close" in df.columns:
+                return pd.to_numeric(df["Close"], errors="coerce")
+            # Fallback: first numeric column
+            for col in df.columns:
+                series = pd.to_numeric(df[col], errors="coerce")
+                if series.notna().any():
+                    return series
+            return pd.Series(dtype=float)
+
+        stock_close = _get_close(stock_history)
+        index_close = _get_close(index_history)
+
+        stock_ret = stock_close.pct_change()
+        index_ret = index_close.pct_change()
+
+        combined = pd.concat([stock_ret, index_ret], axis=1).dropna()
+        if combined.empty:
+            return YFMarketCorrelation(index_ticker, None, None, None)
+
+        combined = combined.tail(window_days)
+        if len(combined) < 10:
+            return YFMarketCorrelation(index_ticker, None, None, len(combined))
+
+        corr = combined.iloc[:, 0].corr(combined.iloc[:, 1])
+        beta = None
+        try:
+            var = combined.iloc[:, 1].var()
+            if var != 0 and pd.notna(var):
+                beta = combined.iloc[:, 0].cov(combined.iloc[:, 1]) / var
+        except Exception:
+            beta = None
+
+        return YFMarketCorrelation(
+            index_ticker=index_ticker,
+            correlation_1y=_round_opt(corr, 2),
+            beta_1y=_round_opt(beta, 2) if beta is not None else None,
+            overlap_days=len(combined),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# -----------------------------
+# 6) earnings/events (calendar / earnings_dates)
 # -----------------------------
 
 
@@ -270,57 +602,7 @@ class YFEarningsEvent:
 
 
 # -----------------------------
-# 4) corporate actions (actions/dividends/splits)
-# -----------------------------
-
-
-@dataclass(frozen=True)
-class YFCorporateActions:
-    last_split_date_iso: Optional[str]
-    last_split_ratio: Optional[float]
-    last_dividend_date_iso: Optional[str]
-    last_dividend_amount: Optional[float]
-
-    @staticmethod
-    def from_actions_dividends_splits(
-        actions: Optional[pd.DataFrame] = None,
-        dividends: Optional[pd.Series] = None,
-        splits: Optional[pd.Series] = None,
-    ) -> "YFCorporateActions":
-        """
-        Keep only the most recent split/dividend information.
-        """
-        last_split_date = None
-        last_split_ratio = None
-        if isinstance(splits, pd.Series) and not splits.empty:
-            try:
-                last_split_date = pd.to_datetime(splits.index[-1]).date().isoformat()
-                last_split_ratio = _to_float(splits.iloc[-1])
-            except Exception:
-                pass
-
-        last_div_date = None
-        last_div_amt = None
-        if isinstance(dividends, pd.Series) and not dividends.empty:
-            try:
-                last_div_date = pd.to_datetime(dividends.index[-1]).date().isoformat()
-                last_div_amt = _to_float(dividends.iloc[-1])
-            except Exception:
-                pass
-
-        return YFCorporateActions(
-            last_split_date_iso=last_split_date,
-            last_split_ratio=last_split_ratio,
-            last_dividend_date_iso=last_div_date,
-            last_dividend_amount=last_div_amt,
-        )
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
-# -----------------------------
-# 5) optional: analyst recs (soft signal)
+# 8) optional: analyst recs (soft signal)
 # -----------------------------
 
 
@@ -360,8 +642,7 @@ class YFAnalystSignal:
             key in colmap for key in ("tograde", "fromgrade", "action", "firm")
         )
         has_trend_cols = any(
-            key in colmap
-            for key in ("strongbuy", "buy", "hold", "sell", "strongsell")
+            key in colmap for key in ("strongbuy", "buy", "hold", "sell", "strongsell")
         )
 
         # --- Upgrade/Downgrade history style ---
@@ -382,7 +663,9 @@ class YFAnalystSignal:
                 latest = df.iloc[-1] if len(df) else None
                 latest_date_iso = None
                 if latest is not None and pd.notna(latest.get("_dt")):
-                    latest_date_iso = pd.to_datetime(latest.get("_dt")).date().isoformat()
+                    latest_date_iso = (
+                        pd.to_datetime(latest.get("_dt")).date().isoformat()
+                    )
                 dt_series = df["_dt"]
             else:
                 latest = df.iloc[-1] if len(df) else None
@@ -424,6 +707,7 @@ class YFAnalystSignal:
 
         # --- Recommendation trend style (counts by period) ---
         if has_trend_cols:
+
             def _num(col_key: str, row: pd.Series) -> float:
                 col = colmap.get(col_key)
                 if col is None:
@@ -449,6 +733,7 @@ class YFAnalystSignal:
                 "sell": _num("sell", latest_row),
                 "strong_sell": _num("strongsell", latest_row),
             }
+
             def _score(row: pd.Series) -> float:
                 return (
                     _num("strongbuy", row) * 2.0
@@ -500,6 +785,9 @@ class YFAnalystSignal:
 # Example usage (you wire yfinance calls yourself):
 #   info_filtered = YFInfoFundamentals.from_yfinance_info(info).to_dict()
 #   fast_filtered = YFFastInfoSnapshot.from_yfinance_fast_info(fast_info).to_dict()
+#   price_history = YFPriceHistorySummary.from_history(history_df).to_dict()
+#   nav_discount = YFNavDiscountPremium.from_yfinance_info(info, fast_info).to_dict()
+#   corr = YFMarketCorrelation.from_histories(stock_hist, index_hist, index_ticker="^OMX").to_dict()
 #   earnings = YFEarningsEvent.from_calendar_or_earnings_dates(calendar, earnings_dates).to_dict()
 #   actions = YFCorporateActions.from_actions_dividends_splits(actions_df, dividends_series, splits_series).to_dict()
 #   analyst = YFAnalystSignal.from_recommendations(recs_df).to_dict()

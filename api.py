@@ -2,21 +2,22 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     MarketOrderRequest,
     GetOrdersRequest,
-    GetActivitiesRequest,
 )
-from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus, ActivityType
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus, OrderStatus
 from dotenv import load_dotenv
 import os
 from datetime import datetime, timezone
 
 
-# paper=True enables paper trading
+def init_client():
+    # paper=True enables paper trading
 
-load_dotenv()  # reads .env in current working dir
-alpaca_secret_key = os.getenv("alpaca_secret_key")
-alpaca_key = os.getenv("alpaca_key")
+    load_dotenv()  # reads .env in current working dir
+    alpaca_secret_key = os.getenv("alpaca_secret_key")
+    alpaca_key = os.getenv("alpaca_key")
 
-trading_client = TradingClient(alpaca_key, alpaca_secret_key, paper=True)
+    trading_client = TradingClient(alpaca_key, alpaca_secret_key, paper=True)
+    return trading_client
 
 
 def alpaca_portfolio_context(trading_client: TradingClient) -> str:
@@ -91,9 +92,19 @@ def alpaca_portfolio_context(trading_client: TradingClient) -> str:
     # --------------------
     # RECENT FILLS
     # --------------------
-    fills = trading_client.get_activities(
-        GetActivitiesRequest(activity_types=[ActivityType.FILL], page_size=10)
+    # alpaca-py 0.43.x does not expose account activities on TradingClient.
+    # Approximate "recent fills" by looking at recently closed orders with fills.
+    closed_orders = trading_client.get_orders(
+        GetOrdersRequest(status=QueryOrderStatus.CLOSED, nested=True, limit=50)
     )
+    fills = [
+        o
+        for o in closed_orders
+        if o.filled_at is not None
+        and (o.status == OrderStatus.FILLED or o.status == OrderStatus.PARTIALLY_FILLED)
+    ]
+    fills.sort(key=lambda o: o.filled_at or o.submitted_at, reverse=True)
+    fills = fills[:10]
 
     lines.append("RECENT FILLS")
     if not fills:
@@ -103,9 +114,9 @@ def alpaca_portfolio_context(trading_client: TradingClient) -> str:
             lines.append(
                 f"{f.symbol} | "
                 f"{f.side.upper()} | "
-                f"Qty: {f.qty} | "
-                f"Price: {f.price} | "
-                f"Time: {f.transaction_time}"
+                f"Qty: {f.filled_qty or f.qty} | "
+                f"Price: {f.filled_avg_price or f.limit_price} | "
+                f"Time: {f.filled_at}"
             )
 
     # --------------------
@@ -151,6 +162,3 @@ def bracketBuy(Ticker, qty, take_profit, stop_loss):
     )
     response = trading_client.submit_order(bracketOrder)
     return response
-
-
-print(get_Portfolio_data())

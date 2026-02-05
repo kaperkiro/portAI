@@ -6,6 +6,8 @@ import time
 import json
 from google import genai
 import AI_calls as AIC
+import api
+
 
 LOOKOUT_LIST = []
 
@@ -65,6 +67,21 @@ def add_market_analysis_stock(analysis_json: str | dict | None) -> cl.Stock | No
         state="watch",
     )
     return stock
+
+
+def analyzeAIResult(AIResult):
+    if AIResult == None or AIResult == "no opportunity":
+        return
+    else:
+        ticker = AIResult["ticker"]
+        qty = AIResult["buy_in_quantity"]
+        take_profit1 = {"limit_price": AIResult["take_profit_1"]}
+        take_profit2 = {"limit_price": AIResult["take_profit_2"]}
+        stop_loss = AIResult["stop_loss"]
+        # place two order to simulate the double take profit levels:
+        api.bracketBuy(ticker, qty, take_profit1, stop_loss)
+        api.bracketBuy(ticker, qty, take_profit2, stop_loss)
+    return
 
 
 RUN_TIMES = ["16:29", "16:32"]  # local time; edit this list to change runs per day
@@ -132,8 +149,14 @@ def _main() -> None:
 
 if __name__ == "__main__":
     # _main()
-    # cl.save_string_to_json(get_current_ticker_data("NVDA"))
     load_dotenv()  # reads .env in current working dir
     api_key = os.getenv("GEMINI_API_KEY")
     client = genai.Client(api_key=api_key)
-    print(AIC.daily_market_analysis(client))
+    # init alpaca trading client:
+    alpaca_client = api.init_client()
+    current_port_state = api.alpaca_portfolio_context(alpaca_client)
+    print(current_port_state)
+    res = AIC.daily_market_analysis(client, current_port_state)
+    print(res)
+    # # resObj = json.loads(res)
+    # # analyzeAIResult(resObj)

@@ -1,15 +1,13 @@
 from datetime import datetime, timezone
 import re
-
 import yfinance as yf
 from google.genai import types
-
 import classes as cl
 import helpers as hp
 
 
 # AI helper tools:
-def get_current_ticker_data(ticker: str) -> str:
+def get_current_ticker_data(ticker: str, index_ticker: str = "^OMX") -> str:
     data = yf.Ticker(ticker)
     print(f"Ran ticker data with ticker: {ticker}")
     # implement some error handling
@@ -17,18 +15,47 @@ def get_current_ticker_data(ticker: str) -> str:
     fast_filtered = hp.YFFastInfoSnapshot.from_yfinance_fast_info(
         data.fast_info
     ).to_dict()
+    nav_discount = hp.YFNavDiscountPremium.from_yfinance_info(
+        data.info, data.fast_info
+    ).to_dict()
+    try:
+        history_df = data.history(period="3mo", interval="1d")
+    except Exception:
+        history_df = None
+    price_history = hp.YFPriceHistorySummary.from_history(history_df).to_dict()
+    try:
+        stock_hist_1y = data.history(period="1y", interval="1d")
+    except Exception:
+        stock_hist_1y = None
+    try:
+        index_hist_1y = (
+            yf.Ticker(index_ticker).history(period="1y", interval="1d")
+            if index_ticker
+            else None
+        )
+    except Exception:
+        index_hist_1y = None
+    market_correlation = hp.YFMarketCorrelation.from_histories(
+        stock_hist_1y,
+        index_hist_1y,
+        index_ticker=index_ticker,
+    ).to_dict()
     earnings = hp.YFEarningsEvent.from_calendar_or_earnings_dates(
         data.calendar, data.earnings_dates
-    ).to_dict()
-    actions = hp.YFCorporateActions.from_actions_dividends_splits(
-        data.actions, data.dividends, data.splits
     ).to_dict()
     analyst = hp.YFAnalystSignal.from_recommendations(data.recommendations).to_dict()
 
     price_targets = data.get_analyst_price_targets()
 
     payload = hp.format_ticker_data_for_ai(
-        info_filtered, fast_filtered, earnings, actions, analyst, price_targets
+        info_filtered=info_filtered,
+        fast_filtered=fast_filtered,
+        price_history=price_history,
+        nav_discount=nav_discount,
+        market_correlation=market_correlation,
+        earnings=earnings,
+        analyst=analyst,
+        price_targets=price_targets,
     )
     ticker_line = f"ticker: {str(ticker).upper()}"
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -128,11 +155,11 @@ def _extract_tickers(text: str) -> list[str]:
     return tickers
 
 
-def daily_market_analysis(client):
+def daily_market_analysis(client, current_port):
     # -----------------------
     # STEP 1: Google Search ONLY
     # -----------------------
-    prompt1 = """
+    prompt1 = f"""
     You are a professional portfolio manager and short-term swing trader (3–6 months).
 
     Task:
@@ -142,14 +169,16 @@ def daily_market_analysis(client):
     - Sector rotation and relative strength
     - Major catalysts (earnings trends, guidance, AI, energy, defense, healthcare, regulation)
     - Liquidity and institutional relevance
+    - Take into account the current trading portfolio state: {current_port}
+    - You can still choose to fill up stock already in the portfolio if there is and swind opportunity.
 
     Universe:
-    - Large and mega-cap US, EU and ASIA equities only
+    - Large SWEDISH equities only
     - Highly liquid stocks (no microcaps, no thin volume)
     - Avoid stocks with earnings within the next 7 calendar days unless the catalyst is earnings-driven
 
     Objective:
-    Identify up to 5 of the most interesting stock tickers that may offer a high risk-adjusted swing trade opportunity over the next 30–180 days.
+    Identify up to 3 of the most interesting stock tickers that may offer a high risk-adjusted swing trade opportunity over the next 30–180 days.
 
     Rules:
     - Do NOT invent prices or technical levels
@@ -168,16 +197,16 @@ def daily_market_analysis(client):
 
     Example:
     MARKET_CONTEXT: Risk-on tone as rate fears ease; AI capex remains dominant; defensives lag; energy mixed; volatility moderate.
-    TICKERS: AAPL, MSFT, NVDA
     """.strip()
 
+    # thinking_config=types.ThinkingConfig(thinking_level="high"),
     grounding_tool = types.Tool(google_search=types.GoogleSearch())
     config1 = types.GenerateContentConfig(
-        thinking_config=types.ThinkingConfig(thinking_level="high"),
+        # thinking_config=types.ThinkingConfig(thinking_level="high"),
         tools=[grounding_tool],
         temperature=0.1,
     )
-
+    print("running first prompt")
     resp1 = client.models.generate_content(
         model="gemini-3-flash-preview",
         contents=prompt1,
@@ -254,19 +283,20 @@ def daily_market_analysis(client):
     - If there IS an opportunity, output EXACTLY one object with NO extra keys, NO comments, NO markdown:
 
     {{
-    "ticker": "STRING",
+    "ticker": "STRING(Make sure ticker is in correct format for yahoo finance python api)",
     "current_price": INTEGER,
     "current_price_date": "STRING",
     "order_time_horizon": INTEGER,
     "buy_in_price": NUMBER,
-    "stop_loss": NUMBER,
+    "stop_loss": NUMBER(put a stop loss for autoselling, so give some margin below the support level),
     "take_profit_1": NUMBER,
     "take_profit_2": NUMBER,
     "buy_in_quantity": INTEGER,
-    "buy_motivation" : STRING,
+    "buy_motivation" : STRING(explain why this is worth a buy, explain what the stop loss and take profit levels are what they are as well as 
+    explaining the cause of recent market trends for this stock),
     "confidence" : INT FROM 1-10
     "additional_info": STRING(explain what more info you would need to get about the stock from the get_current_ticker_data to make a good analysis. If the current data
-    is sufficient return ok, if there is any other specific data you would generally need, write it here)
+    is sufficient return ok, if there is any other specific data you would generally need such as for example price history, or order volume, write it here)
     }}
 
     Constraints:
@@ -281,11 +311,11 @@ def daily_market_analysis(client):
     """.strip()
 
     config2 = types.GenerateContentConfig(
-        thinking_config=types.ThinkingConfig(thinking_level="high"),
+        # thinking_config=types.ThinkingConfig(thinking_level="high"),
         tools=[get_current_ticker_data],
         temperature=0.1,
     )
-
+    print("running second prompt")
     resp2 = client.models.generate_content(
         model="gemini-3-flash-preview",
         contents=prompt2,
