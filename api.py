@@ -7,6 +7,10 @@ from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus, Order
 from dotenv import load_dotenv
 import os
 from datetime import datetime, timezone
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 
 def init_client():
@@ -17,7 +21,18 @@ def init_client():
     alpaca_key = os.getenv("alpaca_key")
 
     trading_client = TradingClient(alpaca_key, alpaca_secret_key, paper=True)
+    logger.info("Initialized Alpaca trading client in paper mode")
     return trading_client
+
+
+def get_portf_buying_power(trading_client: TradingClient) -> int:
+    acc = trading_client.get_account()
+    return acc.buying_power
+
+
+def get_portf_value(trading_client: TradingClient) -> int:
+    acc = trading_client.get_account()
+    return acc.portfolio_value
 
 
 def alpaca_portfolio_context(trading_client: TradingClient) -> str:
@@ -125,8 +140,9 @@ def alpaca_portfolio_context(trading_client: TradingClient) -> str:
     return "\n".join(lines)
 
 
-def buyStock(Ticker, qty):
+def buyStock(Ticker, qty, trading_client):
     # tested working!
+    logger.info("Submitting buy order: ticker=%s qty=%s", Ticker, qty)
     buyOrder = MarketOrderRequest(
         symbol=Ticker,
         qty=qty,
@@ -138,8 +154,9 @@ def buyStock(Ticker, qty):
     return buyResponse
 
 
-def sellStock(Ticker, qty):
+def sellStock(Ticker, qty, trading_client):
     # Tested working!
+    logger.info("Submitting sell order: ticker=%s qty=%s", Ticker, qty)
     sellOrder = MarketOrderRequest(
         symbol=Ticker,
         qty=qty,
@@ -151,7 +168,15 @@ def sellStock(Ticker, qty):
     return sellResponse
 
 
-def bracketBuy(Ticker, qty, take_profit, stop_loss):
+def bracketBuy(Ticker, qty, take_profit, stop_loss, trading_client):
+    logger.info(
+        "Submitting bracket buy: ticker=%s qty=%s tp=%s sl=%s",
+        Ticker,
+        qty,
+        take_profit,
+        stop_loss,
+    )
+
     bracketOrder = MarketOrderRequest(
         symbol=Ticker,
         qty=qty,
@@ -162,3 +187,20 @@ def bracketBuy(Ticker, qty, take_profit, stop_loss):
     )
     response = trading_client.submit_order(bracketOrder)
     return response
+
+
+def main() -> None:
+    trading_client = init_client()
+    order = MarketOrderRequest(
+        symbol="AAPL",
+        qty=1,
+        side=OrderSide.BUY,
+        time_in_force=TimeInForce.DAY,
+        take_profit={"limit_price": 300.0},
+        stop_loss={"stop_price": 180.0},
+    )
+    trading_client.submit_order(order)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,8 +1,7 @@
 from dataclasses import dataclass, field, asdict
-from typing import Optional, List, Literal
+from typing import Any, Dict, List, Literal, Optional
 import ast
 import json
-from typing import Any, Dict, Optional
 import os
 import tempfile
 
@@ -145,87 +144,102 @@ def save_portfolio_to_json(portfolio: Portfolio, path: str = "data.json") -> Non
                 pass
 
 
+def _parse_scalar(val: str) -> Any:
+    if val == "":
+        return ""
+    lowered = val.lower()
+    if lowered in {"none", "null"}:
+        return None
+    if lowered in {"true", "false"}:
+        return lowered == "true"
+    # int first, then float
+    try:
+        if val.lstrip("+-").isdigit():
+            return int(val)
+    except Exception:
+        pass
+    try:
+        return float(val)
+    except Exception:
+        pass
+    # try JSON for objects/arrays
+    if (val.startswith("{") and val.endswith("}")) or (
+        val.startswith("[") and val.endswith("]")
+    ):
+        try:
+            return json.loads(val)
+        except Exception:
+            pass
+        try:
+            return ast.literal_eval(val)
+        except Exception:
+            pass
+    return val
+
+
+def _parse_ai_text_to_json(text: str) -> Optional[Dict[str, Any]]:
+    lines = text.splitlines()
+    result: Dict[str, Any] = {}
+    current: Dict[str, Any] = result
+    has_any = False
+
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            if not section:
+                continue
+            result.setdefault(section, {})
+            current = result[section]
+            has_any = True
+            continue
+
+        if line.startswith("- "):
+            line = line[2:]
+        if ":" in line:
+            key, val = line.split(":", 1)
+            key = key.strip()
+            val = val.strip()
+            if not key:
+                continue
+            current[key] = _parse_scalar(val)
+            has_any = True
+
+    return result if has_any else None
+
+
+def parse_ai_response_payload(data: Any) -> Any:
+    """
+    Best-effort parse of AI text into a JSON-serializable payload.
+    Handles plain-text sentinel responses like "no opportunity".
+    """
+    if not isinstance(data, str):
+        return data
+
+    text = data.strip()
+    if text.lower() == "no opportunity":
+        return {"text": "no opportunity"}
+
+    try:
+        return json.loads(data)
+    except json.JSONDecodeError:
+        parsed = _parse_ai_text_to_json(data)
+        return parsed if parsed is not None else {"text": data}
+
+
 def save_string_to_json(data: str, path: str = "data.json") -> None:
     """
     Save a string to a JSON file. If the string is valid JSON, store it as JSON;
     otherwise store it under a "text" key for readability.
     """
 
-    def _parse_scalar(val: str) -> Any:
-        if val == "":
-            return ""
-        lowered = val.lower()
-        if lowered in {"none", "null"}:
-            return None
-        if lowered in {"true", "false"}:
-            return lowered == "true"
-        # int first, then float
-        try:
-            if val.lstrip("+-").isdigit():
-                return int(val)
-        except Exception:
-            pass
-        try:
-            return float(val)
-        except Exception:
-            pass
-        # try JSON for objects/arrays
-        if (val.startswith("{") and val.endswith("}")) or (
-            val.startswith("[") and val.endswith("]")
-        ):
-            try:
-                return json.loads(val)
-            except Exception:
-                pass
-            try:
-                return ast.literal_eval(val)
-            except Exception:
-                pass
-        return val
-
-    def _parse_ai_text_to_json(text: str) -> Optional[Dict[str, Any]]:
-        lines = text.splitlines()
-        result: Dict[str, Any] = {}
-        current: Dict[str, Any] = result
-        has_any = False
-
-        for raw in lines:
-            line = raw.strip()
-            if not line:
-                continue
-            if line.startswith("[") and line.endswith("]"):
-                section = line[1:-1].strip()
-                if not section:
-                    continue
-                result.setdefault(section, {})
-                current = result[section]
-                has_any = True
-                continue
-
-            if line.startswith("- "):
-                line = line[2:]
-            if ":" in line:
-                key, val = line.split(":", 1)
-                key = key.strip()
-                val = val.strip()
-                if not key:
-                    continue
-                current[key] = _parse_scalar(val)
-                has_any = True
-
-        return result if has_any else None
-
     directory = os.path.dirname(path) or "."
     fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".data.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            payload = data
-            if isinstance(data, str):
-                try:
-                    payload = json.loads(data)
-                except json.JSONDecodeError:
-                    parsed = _parse_ai_text_to_json(data)
-                    payload = parsed if parsed is not None else {"text": data}
+            payload = parse_ai_response_payload(data)
             json.dump(payload, f, indent=2)
             f.flush()
             os.fsync(f.fileno())

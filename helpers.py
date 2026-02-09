@@ -61,7 +61,6 @@ def format_ticker_data_for_ai(
     info_filtered: Dict[str, Any],
     fast_filtered: Dict[str, Any],
     earnings: Dict[str, Any],
-    actions: Dict[str, Any],
     analyst: Dict[str, Any],
     price_targets: Optional[Dict[str, Any]] = None,
     price_history: Optional[Dict[str, Any]] = None,
@@ -79,7 +78,6 @@ def format_ticker_data_for_ai(
         ("nav_discount", nav_discount or {}),
         ("market_correlation", market_correlation or {}),
         ("earnings_event", earnings),
-        ("corporate_actions", actions),
         ("analyst_signal", analyst),
         ("analyst_price_targets", price_targets or {}),
     ]
@@ -459,16 +457,20 @@ class YFNavDiscountPremium:
 
 
 # -----------------------------
-# 5) index correlation (beta-adjusted context)
+# 5) index correlation (6-12m risk context; not directional)
 # -----------------------------
 
 
 @dataclass(frozen=True)
 class YFMarketCorrelation:
-    index_ticker: Optional[str]
-    correlation_1y: Optional[float]
-    beta_1y: Optional[float]
-    overlap_days: Optional[int]
+    """
+    Use only for risk adjustment/context, not for directional prediction.
+    """
+
+    index: Optional[str]
+    correlation_6_12m: Optional[float]
+    beta_6_12m: Optional[float]
+    interpretation: Optional[str]
 
     @staticmethod
     def from_histories(
@@ -478,13 +480,34 @@ class YFMarketCorrelation:
         index_ticker: str,
         window_days: int = 252,
     ) -> "YFMarketCorrelation":
+        def _index_label(raw: Optional[str]) -> Optional[str]:
+            if raw is None:
+                return None
+            s = str(raw).strip()
+            if s.startswith("^"):
+                s = s[1:]
+            return s or None
+
+        def _interpret(corr: Optional[float], beta: Optional[float]) -> Optional[str]:
+            if corr is None or beta is None:
+                return "insufficient-data"
+            abs_corr = abs(corr)
+            abs_beta = abs(beta)
+            if abs_corr >= 0.6:
+                return "market-driven"
+            if abs_corr <= 0.4:
+                return "stock-specific"
+            # Mid-range correlation: let beta break the tie
+            return "market-driven" if abs_beta >= 1.0 else "stock-specific"
+
+        index_label = _index_label(index_ticker)
         if (
             not isinstance(stock_history, pd.DataFrame)
             or stock_history.empty
             or not isinstance(index_history, pd.DataFrame)
             or index_history.empty
         ):
-            return YFMarketCorrelation(index_ticker, None, None, None)
+            return YFMarketCorrelation(index_label, None, None, "insufficient-data")
 
         def _get_close(df: pd.DataFrame) -> pd.Series:
             if "Adj Close" in df.columns:
@@ -506,30 +529,40 @@ class YFMarketCorrelation:
 
         combined = pd.concat([stock_ret, index_ret], axis=1).dropna()
         if combined.empty:
-            return YFMarketCorrelation(index_ticker, None, None, None)
+            return YFMarketCorrelation(index_label, None, None, "insufficient-data")
 
         combined = combined.tail(window_days)
-        if len(combined) < 10:
-            return YFMarketCorrelation(index_ticker, None, None, len(combined))
+        min_days = max(60, int(window_days * 0.5))
+        if len(combined) < min_days:
+            return YFMarketCorrelation(index_label, None, None, "insufficient-data")
 
-        corr = combined.iloc[:, 0].corr(combined.iloc[:, 1])
-        beta = None
+        corr_raw = combined.iloc[:, 0].corr(combined.iloc[:, 1])
+        if corr_raw is not None and pd.isna(corr_raw):
+            corr_raw = None
+        beta_raw = None
         try:
             var = combined.iloc[:, 1].var()
             if var != 0 and pd.notna(var):
-                beta = combined.iloc[:, 0].cov(combined.iloc[:, 1]) / var
+                beta_raw = combined.iloc[:, 0].cov(combined.iloc[:, 1]) / var
         except Exception:
-            beta = None
+            beta_raw = None
+        if beta_raw is not None and pd.isna(beta_raw):
+            beta_raw = None
 
         return YFMarketCorrelation(
-            index_ticker=index_ticker,
-            correlation_1y=_round_opt(corr, 2),
-            beta_1y=_round_opt(beta, 2) if beta is not None else None,
-            overlap_days=len(combined),
+            index=index_label,
+            correlation_6_12m=_round_opt(corr_raw, 2),
+            beta_6_12m=_round_opt(beta_raw, 2) if beta_raw is not None else None,
+            interpretation=_interpret(corr_raw, beta_raw),
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        return {
+            "index": self.index,
+            "correlation_6_12m": self.correlation_6_12m,
+            "beta_6_12m": self.beta_6_12m,
+            "interpretation": self.interpretation,
+        }
 
 
 # -----------------------------

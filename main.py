@@ -4,12 +4,22 @@ import classes as cl
 from datetime import datetime, timedelta
 import time
 import json
+import logging
 from google import genai
 import AI_calls as AIC
 import api
 
 
 LOOKOUT_LIST = []
+logger = logging.getLogger(__name__)
+
+
+def _setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
 
 
 def add_market_analysis_stock(analysis_json: str | dict | None) -> cl.Stock | None:
@@ -69,23 +79,47 @@ def add_market_analysis_stock(analysis_json: str | dict | None) -> cl.Stock | No
     return stock
 
 
-def analyzeAIResult(AIResult):
-    if AIResult == None or AIResult == "no opportunity":
+def analyzeAIResult(AIResult, trading_client):
+    if AIResult is None:
+        return
+    if isinstance(AIResult, str) and AIResult.strip().lower() == "no opportunity":
+        return
+    if not isinstance(AIResult, dict):
+        return
+    elif (
+        "text" in AIResult
+        and isinstance(AIResult["text"], str)
+        and AIResult["text"].strip().lower() == "no opportunity"
+    ):
         return
     else:
+        required_keys = {
+            "ticker",
+            "buy_in_quantity",
+            "take_profit_1",
+            "take_profit_2",
+            "stop_loss",
+        }
+        if not required_keys.issubset(AIResult.keys()):
+            return
+
         ticker = AIResult["ticker"]
         qty = AIResult["buy_in_quantity"]
-        take_profit1 = {"limit_price": AIResult["take_profit_1"]}
-        take_profit2 = {"limit_price": AIResult["take_profit_2"]}
-        stop_loss = AIResult["stop_loss"]
+        take_profit1 = {"limit_price": int(AIResult["take_profit_1"])}
+        take_profit2 = {"limit_price": int(AIResult["take_profit_2"])}
+        stop_loss = {"stop_price": int(AIResult["stop_loss"])}
         # place two order to simulate the double take profit levels:
-        api.bracketBuy(ticker, qty, take_profit1, stop_loss)
-        api.bracketBuy(ticker, qty, take_profit2, stop_loss)
+        api.bracketBuy(ticker, qty / 2, take_profit1, stop_loss, trading_client)
+        api.bracketBuy(ticker, qty / 2, take_profit2, stop_loss, trading_client)
     return
 
 
-RUN_TIMES = ["16:29", "16:32"]  # local time; edit this list to change runs per day
-SMALL_TASK_INTERVAL_MINUTES = 1  # change this to adjust the small task cadence
+RUN_TIMES = [
+    "10:00",
+    "12:00",
+    "15:00",
+]  # local time; edit this list to change runs per day
+SMALL_TASK_INTERVAL_MINUTES = 1000  # change this to adjust the small task cadence
 # change this to us times maybe? as the alpaca only supports us stocks for some reason :/
 
 
@@ -104,28 +138,53 @@ def _next_daily_run(now: datetime, run_times: list[str]) -> datetime:
     )
 
 
-def _run_daily_tasks(portfolio: cl.Portfolio, client) -> None:
-    print("testing daily task")
-    # stockJson = daily_market_analysis(client)
-    # if stockJson is not None:
-    #     stock = add_market_analysis_stock(stockJson)
-    #     if stock is not None:
-    #         LOOKOUT_LIST.append(stock)
-    # cl.save_portfolio_to_json(portfolio, "data.json")
+def handle_daily_sell(stocks, alpaca_client):
+    if stocks:
+        for item in stocks:
+            try:
+                api.sellStock(item[0], item[1], alpaca_client)
+            except Exception as e:
+                logger.error("Error while selling %s: %s", item[0], e)
+    return
 
 
-def _run_small_tasks(portfolio: cl.Portfolio) -> None:
-    print("testing smaller task")
+def _run_daily_tasks(client, alpaca_client) -> None:
+    logger.info("Running daily task cycle")
+
+    # run daily port analysis
+    current_port_state = api.alpaca_portfolio_context(alpaca_client)
+    daily_port_res = json.loads(AIC.daily_port_analysis(current_port_state, client))
+    handle_daily_sell(daily_port_res, alpaca_client)
+
+    # run daily market analysis
+    buying_power = api.get_portf_buying_power(alpaca_client)
+    res = AIC.daily_market_analysis(client, current_port_state, buying_power)
+    result_state = (
+        "no opportunity"
+        if isinstance(res, str) and res.strip().lower() == "no opportunity"
+        else "opportunity returned"
+    )
+    logger.info("Daily market analysis completed: %s", result_state)
+    resObj = cl.parse_ai_response_payload(res)
+    analyzeAIResult(resObj, alpaca_client)
+
+
+def _run_small_tasks() -> None:
+    logger.info("Running small task cycle")
     # add small, frequent tasks here
     # cl.save_portfolio_to_json(portfolio, "data.json")
 
 
 def _main() -> None:
+    _setup_logging()
+    logger.info("Starting scheduler")
+
+    # load AI:
     load_dotenv()  # reads .env in current working dir
     api_key = os.getenv("GEMINI_API_KEY")
     client = genai.Client(api_key=api_key)
-
-    AIport = cl.Portfolio()
+    # init alpaca trading client:
+    alpaca_client = api.init_client()
     run_times = sorted(RUN_TIMES)
 
     next_daily_run = _next_daily_run(datetime.now(), run_times)
@@ -133,12 +192,32 @@ def _main() -> None:
 
     while True:
         now = datetime.now()
+        if now.weekday() >= 5:  # Saturday=5, Sunday=6
+            days_until_monday = 7 - now.weekday()
+            resume_at = datetime.combine(
+                (now + timedelta(days=days_until_monday)).date(),
+                datetime.min.time(),
+            )
+            logger.info(
+                "Weekend detected, pausing scheduler until %s",
+                resume_at.strftime("%Y-%m-%d %H:%M"),
+            )
+            time.sleep(max(0.0, (resume_at - now).total_seconds()))
+            now = datetime.now()
+            next_daily_run = _next_daily_run(now, run_times)
+            next_small_run = now + timedelta(minutes=SMALL_TASK_INTERVAL_MINUTES)
+            continue
+
         if now >= next_daily_run:
-            _run_daily_tasks(AIport, client)
-            next_daily_run = _next_daily_run(datetime.now(), run_times)
+            try:
+                _run_daily_tasks(client, alpaca_client)
+            except Exception as e:
+                logger.error("Error in daily task cycle: %s", e)
+            finally:
+                next_daily_run = _next_daily_run(datetime.now(), run_times)
 
         if now >= next_small_run:
-            _run_small_tasks(AIport)
+            _run_small_tasks()
             next_small_run = datetime.now() + timedelta(
                 minutes=SMALL_TASK_INTERVAL_MINUTES
             )
@@ -148,15 +227,4 @@ def _main() -> None:
 
 
 if __name__ == "__main__":
-    # _main()
-    load_dotenv()  # reads .env in current working dir
-    api_key = os.getenv("GEMINI_API_KEY")
-    client = genai.Client(api_key=api_key)
-    # init alpaca trading client:
-    alpaca_client = api.init_client()
-    current_port_state = api.alpaca_portfolio_context(alpaca_client)
-    print(current_port_state)
-    res = AIC.daily_market_analysis(client, current_port_state)
-    print(res)
-    # # resObj = json.loads(res)
-    # # analyzeAIResult(resObj)
+    _main()

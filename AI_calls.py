@@ -1,15 +1,81 @@
 from datetime import datetime, timezone
 import re
+import logging
 import yfinance as yf
 from google.genai import types
 import classes as cl
 import helpers as hp
 
 
+EXCHANGE_TO_INDEX = {
+    # United States
+    "NYSE": "^GSPC",  # S&P 500
+    "NASDAQ": "^IXIC",  # Nasdaq Composite
+    "NMS": "^IXIC",  # Nasdaq National Market System
+    "NGM": "^IXIC",  # Nasdaq Global Market
+    "NCM": "^IXIC",  # Nasdaq Capital Market
+    "AMEX": "^GSPC",  # NYSE American
+    "BATS": "^GSPC",
+    "PCX": "^GSPC",  # NYSE Arca
+    # Sweden
+    "STO": "^OMX",  # OMX Stockholm All-Share
+    #  Germany
+    "FRA": "^GDAXI",  # DAX
+    "XETRA": "^GDAXI",
+    #  United Kingdom
+    "LSE": "^FTSE",  # FTSE 100
+    # France
+    "PAR": "^FCHI",  # CAC 40
+    # Italy
+    "MIL": "FTSEMIB.MI",  # FTSE MIB
+    # Spain
+    "MCE": "^IBEX",  # IBEX 35
+    # Netherlands
+    "AMS": "^AEX",  # AEX
+    # Switzerland
+    "SWX": "^SSMI",  # SMI
+    # Japan
+    "TSE": "^N225",  # Nikkei 225
+    # China
+    "SHH": "000001.SS",  # Shanghai Composite
+    "SHZ": "399001.SZ",  # Shenzhen Composite
+    # Hong Kong
+    "HKG": "^HSI",  # Hang Seng Index
+    # South Korea
+    "KOE": "^KS11",  # KOSPI
+    # India
+    "NSE": "^NSEI",  # NIFTY 50
+    "BSE": "^BSESN",  # Sensex
+    # Canada
+    "TOR": "^GSPTSE",  # TSX Composite
+    # Australia
+    "ASX": "^AXJO",  # ASX 200
+    # Brazil
+    "SAO": "^BVSP",  # Bovespa
+    # Mexico
+    "MEX": "^MXX",  # IPC Mexico
+    # South Africa
+    "JNB": "^JN0U.JO",  # FTSE/JSE All Share
+    # Singapore
+    "SES": "^STI",  # Straits Times Index
+}
+
+logger = logging.getLogger(__name__)
+
+
 # AI helper tools:
-def get_current_ticker_data(ticker: str, index_ticker: str = "^OMX") -> str:
+def get_current_ticker_data(ticker: str) -> str:
     data = yf.Ticker(ticker)
-    print(f"Ran ticker data with ticker: {ticker}")
+    info = data.info
+    try:
+        index = EXCHANGE_TO_INDEX[info.get("exchange")]
+        index_hist_1y = (
+            yf.Ticker(index).history(period="1y", interval="1d") if index else None
+        )
+    except Exception:
+        index_hist_1y = None
+
+    logger.info("Ran ticker data with ticker: %s, with index: %s", ticker, index)
     # implement some error handling
     info_filtered = hp.YFInfoFundamentals.from_yfinance_info(data.info).to_dict()
     fast_filtered = hp.YFFastInfoSnapshot.from_yfinance_fast_info(
@@ -27,18 +93,11 @@ def get_current_ticker_data(ticker: str, index_ticker: str = "^OMX") -> str:
         stock_hist_1y = data.history(period="1y", interval="1d")
     except Exception:
         stock_hist_1y = None
-    try:
-        index_hist_1y = (
-            yf.Ticker(index_ticker).history(period="1y", interval="1d")
-            if index_ticker
-            else None
-        )
-    except Exception:
-        index_hist_1y = None
+
     market_correlation = hp.YFMarketCorrelation.from_histories(
         stock_hist_1y,
         index_hist_1y,
-        index_ticker=index_ticker,
+        index_ticker=index,
     ).to_dict()
     earnings = hp.YFEarningsEvent.from_calendar_or_earnings_dates(
         data.calendar, data.earnings_dates
@@ -68,63 +127,92 @@ def get_current_ticker_data(ticker: str, index_ticker: str = "^OMX") -> str:
     return output
 
 
-def daily_port_analysis(portfolio: cl.Portfolio, client):
-    prompt = f"""You are an AI portfolio trading manager for a cash-only account.
-    You can only buy and sell stocks and funds (no shorting, no leverage).
+def daily_port_analysis(current_port, client):
+    prompt = f"""
+        You are an AI portfolio monitoring agent for a cash-only account.
+        You can only SELL existing positions (no buying, no shorting, no leverage).
 
-    Input:
-    You receive a portfolio object with cash, value, stocks, and funds.
-    Each stock/fund includes quantity, value, buy price, stop loss, take profit levels, and state.
-    Provided data is authoritative.
+        Context:
+        - Stop-loss and take-profit execution is handled by a separate system.
+        - Your role is NOT to manage exits mechanically.
+        - Your role is to determine whether NEW EXTERNAL INFORMATION
+        justifies breaking or modifying the original investment strategy.
 
-    Task:
-    Analyze the portfolio and identify any stocks or funds that should be SOLD or PARTIALLY SOLD today.
+        Critical requirement:
+        You MUST use Search to assess whether the market, sector,
+        or company-specific environment has materially changed since entry.
+        Your decisions must be grounded in current, externally verified information.
 
-    Rules:
-    - Use provided portfolio and position data first.
-    - Use web search ONLY to check for material news, earnings, guidance, regulatory, or macro events.
-    - Do NOT guess prices or invent data.
-    - If no relevant news is found, state that clearly.
-    - Recommend SELL or PARTIAL SELL only if:
-    - stop loss is hit or invalidated,
-    - take profit level is reached,
-    - new information breaks the investment thesis,
-    - risk has materially increased,
-    - position is oversized and risk reduction is justified.
-    - Be conservative; ignore short-term noise.
-    - For funds, consider annual fee, overlap, and long-term suitability.
+        Input:
+        You receive a portfolio object containing current holdings.
+        For each stock or fund, you are given:
+        - ticker
+        - current quantity held
+        - buy price
+        - current value
+        - sector / classification
+        - other provided metadata
 
-    Output (STRICT):
-    1) Summary: one short paragraph answering if any positions should be sold.
-    2) Action List (only if applicable), format:
+        All provided portfolio data is authoritative.
 
-    SYMBOL:
-    Action: SELL | PARTIAL SELL | HOLD
-    Reason:
-    - bullet reasons (data + news)
-    Confidence: LOW | MEDIUM | HIGH
+        Task:
+        Using BOTH:
+        1) the provided portfolio data, and
+        2) current information obtained via Google Search,
+        3) news, lastest earnings, current market state etc
 
-    3) If no sells are needed, state:
-    "No positions require selling today based on available data."
+        analyze whether any positions should be SOLD or PARTIALLY SOLD **today**,
+        despite the original strategy.
 
-    4) Risk Notes (optional): upcoming earnings, macro risks, data uncertainty.
+        Recommend a sell ONLY if Google Search confirms at least one of the following:
+        - market regime has shifted (e.g. risk-on → risk-off)
+        - sector or industry has entered sustained underperformance
+        - new macro, regulatory, earnings, or company-specific risks exist
+        - the original investment thesis is materially weakened
+        - portfolio-level risk reduction is justified due to external conditions
 
-    Constraints:
-    - No disclaimers.
-    - If uncertain, say "uncertain".
-    - Do not output anything outside this structure.
-    
-    This is the portfolio information: {portfolio.to_dict}
+        Do NOT sell based on:
+        - normal volatility or price fluctuations
+        - stop-loss or take-profit logic
+        - speculative or unverified information
 
-    the return a list of tuples. Where each tuple contains the ticker of the stock to sell, and the second position of the tuple is
-    how much % to sell. If there are no stocks to sell, return an empty list. Do not return anything else!
-    """
+        Rules:
+        - Do NOT guess prices or fabricate data.
+        - If Google Search finds no relevant or material changes, do NOT sell.
+        - Be conservative: absence of strong evidence = hold.
+
+        Output (STRICT):
+        Return a list of tuples in the following format:
+        [
+        ("TICKER", quantity_to_sell),
+        ...
+        ]
+
+        Output rules:
+        - quantity_to_sell must be ≤ the quantity currently held
+        - Do NOT label sells as partial or full
+        - Do NOT include tickers that should be held
+        - If no sells are justified, return an empty list: []
+
+        Do NOT output explanations, reasoning, or disclaimers.
+        Do NOT output anything outside this structure.
+
+        Portfolio data:
+        {current_port}
+        """
+
+    grounding_tool = types.Tool(google_search=types.GoogleSearch())
+    config = types.GenerateContentConfig(
+        # thinking_config=types.ThinkingConfig(thinking_level="high"),
+        tools=[grounding_tool],
+        temperature=0.1,
+    )
 
     response = client.models.generate_content(
-        model="gemini-3-flash-preview",
-        contents=prompt,
-        tools=[{"google_search": {}}],
+        model="gemini-3-flash-preview", contents=prompt, config=config
     )
+
+    return response.text
 
 
 def _extract_tickers(text: str) -> list[str]:
@@ -155,7 +243,8 @@ def _extract_tickers(text: str) -> list[str]:
     return tickers
 
 
-def daily_market_analysis(client, current_port):
+def daily_market_analysis(client, current_port, buying_power):
+    logger.info("Running daily market analysis")
     # -----------------------
     # STEP 1: Google Search ONLY
     # -----------------------
@@ -170,15 +259,25 @@ def daily_market_analysis(client, current_port):
     - Major catalysts (earnings trends, guidance, AI, energy, defense, healthcare, regulation)
     - Liquidity and institutional relevance
     - Take into account the current trading portfolio state: {current_port}
-    - You can still choose to fill up stock already in the portfolio if there is and swind opportunity.
+
+    IMPORTANT — Position management constraint:
+    - Do NOT repeatedly rebuy or add to positions already held by default.
+    - Adding to an existing position is allowed ONLY if there is NEW information
+    that materially improves the risk/reward versus the original entry.
+    - “Still attractive”, “still strong”, or “unchanged thesis” is NOT a valid reason to add.
+    - If no clear add-specific catalyst or structural change exists, treat existing positions as HOLD.
 
     Universe:
-    - Large SWEDISH equities only
+    - Large US equities only
     - Highly liquid stocks (no microcaps, no thin volume)
     - Avoid stocks with earnings within the next 7 calendar days unless the catalyst is earnings-driven
 
     Objective:
-    Identify up to 3 of the most interesting stock tickers that may offer a high risk-adjusted swing trade opportunity over the next 30–180 days.
+    Identify up to 5 stock tickers that offer the BEST incremental risk-adjusted swing trade
+    opportunities over the next 30–180 days.
+    Preference should be given to:
+    - New ideas not currently held, OR
+    - Existing holdings ONLY if a justified add scenario exists (new structure, thesis expansion).
 
     Rules:
     - Do NOT invent prices or technical levels
@@ -193,7 +292,7 @@ def daily_market_analysis(client, current_port):
     If stocks ARE interesting, output EXACTLY in this 2-line format with no extra text:
 
     MARKET_CONTEXT: <one short paragraph, max 60 words>
-    TICKERS: <comma-separated list of ticker symbols in uppercase>
+    TICKERS: <comma-separated list of ticker symbols in uppercase> (yfinance format)
 
     Example:
     MARKET_CONTEXT: Risk-on tone as rate fears ease; AI capex remains dominant; defensives lag; energy mixed; volatility moderate.
@@ -206,7 +305,6 @@ def daily_market_analysis(client, current_port):
         tools=[grounding_tool],
         temperature=0.1,
     )
-    print("running first prompt")
     resp1 = client.models.generate_content(
         model="gemini-3-flash-preview",
         contents=prompt1,
@@ -215,6 +313,7 @@ def daily_market_analysis(client, current_port):
 
     step1_text = (resp1.text or "").strip()
     if step1_text.lower() == "no opportunity":
+        logger.info("Daily market analysis step 1: no opportunity")
         return "no opportunity"
 
     # Parse Step 1 output
@@ -234,9 +333,10 @@ def daily_market_analysis(client, current_port):
 
     tickers = _extract_tickers(tickers_line)
     if not tickers:
+        logger.info("Daily market analysis step 1: no valid tickers")
         return "no opportunity"
 
-    print(tickers)
+    logger.info("Daily market analysis step 1 tickers: %s", ",".join(tickers))
     # (Optional) hard cap at 5 to match your requirement
     # tickers = tickers[:5]
 
@@ -259,6 +359,7 @@ def daily_market_analysis(client, current_port):
 
     STRICT TOOL RULES (MANDATORY):
     - You MUST call get_current_ticker_data at least once for EACH ticker in the list.
+    - Buy order can't exceed available buying power, currently: {buying_power}
     - If you cannot retrieve valid data for a ticker, discard it.
     - Do NOT invent prices or levels.
     - Use the retrieved current price and date in your final output.
@@ -286,17 +387,11 @@ def daily_market_analysis(client, current_port):
     "ticker": "STRING(Make sure ticker is in correct format for yahoo finance python api)",
     "current_price": INTEGER,
     "current_price_date": "STRING",
-    "order_time_horizon": INTEGER,
     "buy_in_price": NUMBER,
     "stop_loss": NUMBER(put a stop loss for autoselling, so give some margin below the support level),
     "take_profit_1": NUMBER,
     "take_profit_2": NUMBER,
     "buy_in_quantity": INTEGER,
-    "buy_motivation" : STRING(explain why this is worth a buy, explain what the stop loss and take profit levels are what they are as well as 
-    explaining the cause of recent market trends for this stock),
-    "confidence" : INT FROM 1-10
-    "additional_info": STRING(explain what more info you would need to get about the stock from the get_current_ticker_data to make a good analysis. If the current data
-    is sufficient return ok, if there is any other specific data you would generally need such as for example price history, or order volume, write it here)
     }}
 
     Constraints:
@@ -304,22 +399,29 @@ def daily_market_analysis(client, current_port):
     - buy_in_ammount: currency amount to allocate (e.g. 150)
     - Prices must satisfy:
     stop_loss < buy_in_price < take_profit_1 < take_profit_2
-    - The output must be ONLY the object or "no opportunity"
+    - The output must be ONLY the object or the json "text":"no opportunity"
 
     Tickers to analyze:
     {", ".join(tickers)}
     """.strip()
+
+    # add to prompt for testing:
+    """buy_motivation" : STRING(explain why this is worth a buy, explain what the stop loss and take profit levels are what they are as well as 
+    explaining the cause of recent market trends for this stock),
+    "confidence" : INT FROM 1-10
+    "additional_info": STRING(explain what more info you would need to get about the stock from the get_current_ticker_data to make a good analysis. If the current data
+    is sufficient return ok, if there is any other specific data you would generally need such as for example price history, or order volume, write it here)"""
 
     config2 = types.GenerateContentConfig(
         # thinking_config=types.ThinkingConfig(thinking_level="high"),
         tools=[get_current_ticker_data],
         temperature=0.1,
     )
-    print("running second prompt")
     resp2 = client.models.generate_content(
         model="gemini-3-flash-preview",
         contents=prompt2,
         config=config2,
     )
+    logger.info("Daily market analysis step 2 completed")
 
     return (resp2.text or "").strip()

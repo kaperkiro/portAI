@@ -1,76 +1,14 @@
 {
-  "ticker": "INVE-B.ST",
-  "as_of": "2026-02-05 14:12:08 UTC",
-  "fundamentals": {
-    "sector": "Financial Services",
-    "industry": "Asset Management",
-    "currency": "SEK",
-    "market_cap": 1086862000128.0,
-    "beta": 0.798,
-    "average_volume": 3511596.0,
-    "trailing_pe": 6.901381,
-    "forward_pe": 22.526983,
-    "price_to_book": 1.1396194,
-    "profit_margins_pct": 71.616995,
-    "operating_margins_pct": 80.193,
-    "gross_margins_pct": 84.622,
-    "fifty_two_week_high": 358.3,
-    "fifty_two_week_low": 247.0,
-    "trailing_eps": 51.41,
-    "forward_eps": 15.75,
-    "dividend_yield_pct": 157.0,
-    "debt_to_equity": 12.131
-  },
-  "price_context": {
-    "currency": "SEK"
-  },
-  "price_history": {
-    "last_close": 354.8,
-    "atr_14": 6.63,
-    "atr_14_pct": 1.87,
-    "avg_volume_20d": 3751695,
-    "last_volume": 1477278,
-    "volume_ratio_vs_20d": 0.39,
-    "range_20d_high": 358.3,
-    "range_20d_low": 330.65,
-    "close_vs_20d_high_pct": -0.98,
-    "recent_bars_5d": "2026-01-30 C=343.20 V=2808954; 2026-02-02 C=348.90 V=3897832; 2026-02-03 C=352.70 V=3129346; 2026-02-04 C=356.75 V=4156161; 2026-02-05 C=354.80 V=1477278"
-  },
-  "nav_discount": {
-    "market_price": 354.8,
-    "price_source": "currentPrice"
-  },
-  "market_correlation": {
-    "index_ticker": "^OMX",
-    "correlation_1y": 0.91,
-    "beta_1y": 1.1,
-    "overlap_days": 249
-  },
-  "earnings_event": {
-    "earnings_date_iso": "2026-07-16",
-    "earnings_in_days": 161
-  },
-  "corporate_actions": {
-    "last_split_date_iso": "2021-05-19",
-    "last_split_ratio": 4.0,
-    "last_dividend_date_iso": "2025-11-07",
-    "last_dividend_amount": 1.45
-  },
-  "analyst_signal": {
-    "trend_90d": "mixed",
-    "rating_buckets": {
-      "strong_buy": 0.0,
-      "buy": 3.0,
-      "hold": 2.0,
-      "sell": 1.0,
-      "strong_sell": 0.0
-    }
-  },
-  "analyst_price_targets": {
-    "current": 354.8,
-    "high": 392.0,
-    "low": 300.0,
-    "mean": 360.4,
-    "median": 375.0
-  }
+  "ticker": "NVDA",
+  "current_price": 185,
+  "current_price_date": "2026-02-09",
+  "order_time_horizon": 90,
+  "buy_in_price": 185.41,
+  "stop_loss": 168.5,
+  "take_profit_1": 210.0,
+  "take_profit_2": 235.0,
+  "buy_in_quantity": 10,
+  "buy_motivation": "NVDA is the primary beneficiary of the AI infrastructure spending mentioned in the market context. Technically, the stock has shown a strong reversal from its 20-day low of $171.03, closing at $185.41 on high relative volume (1.33x), indicating institutional support. With a forward P/E of 24x against 66% earnings growth, the valuation is compelling for a 3-6 month swing. The stop loss is placed at $168.50, providing a margin below the recent structural support. Take profit levels are set at the recent high ($210) and toward the mean analyst target ($235), providing a favorable reward-to-risk ratio ahead of the Feb 25 earnings catalyst.",
+  "confidence": 8,
+  "additional_info": "ok"
 }
