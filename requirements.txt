@@ -1,2 +1,5 @@
 google-genai
-dotenv
+python-dotenv
+alpaca-py
+yfinance
+pandas
