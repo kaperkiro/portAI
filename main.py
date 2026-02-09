@@ -9,9 +9,41 @@ from google import genai
 import AI_calls as AIC
 import api
 
-
-LOOKOUT_LIST = []
 logger = logging.getLogger(__name__)
+
+# ===== Gemini rate limiting =====
+GEMINI_DAILY_LIMIT = 30
+_gemini_calls_today = 0
+_gemini_day = datetime.now().date()
+
+
+def _check_gemini_rate_limit():
+    global _gemini_calls_today, _gemini_day
+
+    today = datetime.now().date()
+
+    # Reset counter on new day
+    if today != _gemini_day:
+        _gemini_day = today
+        _gemini_calls_today = 0
+        logger.info("Gemini daily rate limit reset")
+
+    # If limit hit → sleep until tomorrow
+    if _gemini_calls_today >= GEMINI_DAILY_LIMIT:
+        tomorrow = datetime.combine(today + timedelta(days=1), datetime.min.time())
+        sleep_seconds = (tomorrow - datetime.now()).total_seconds()
+
+        logger.warning(
+            "Gemini daily limit reached (%s calls). Sleeping until %s",
+            GEMINI_DAILY_LIMIT,
+            tomorrow.strftime("%Y-%m-%d %H:%M"),
+        )
+
+        time.sleep(max(0.0, sleep_seconds))
+
+        # Reset after sleep
+        _gemini_day = datetime.now().date()
+        _gemini_calls_today = 0
 
 
 def _setup_logging() -> None:
@@ -118,6 +150,10 @@ RUN_TIMES = [
     "10:00",
     "12:00",
     "15:00",
+    "14:25",
+    "14:30",
+    "14:32",
+    "14:35",
 ]  # local time; edit this list to change runs per day
 SMALL_TASK_INTERVAL_MINUTES = 1000  # change this to adjust the small task cadence
 # change this to us times maybe? as the alpaca only supports us stocks for some reason :/
@@ -149,16 +185,20 @@ def handle_daily_sell(stocks, alpaca_client):
 
 
 def _run_daily_tasks(client, alpaca_client) -> None:
+    global _gemini_calls_today
     logger.info("Running daily task cycle")
-
-    # run daily port analysis
     current_port_state = api.alpaca_portfolio_context(alpaca_client)
+    # ---- DAILY PORT ANALYSIS (Gemini call) ----
+    _check_gemini_rate_limit()
+    _gemini_calls_today += 1
     daily_port_res = json.loads(AIC.daily_port_analysis(current_port_state, client))
     handle_daily_sell(daily_port_res, alpaca_client)
-
-    # run daily market analysis
+    # ---- DAILY MARKET ANALYSIS (Gemini call) ----
     buying_power = api.get_portf_buying_power(alpaca_client)
+    _check_gemini_rate_limit()
+    _gemini_calls_today += 1
     res = AIC.daily_market_analysis(client, current_port_state, buying_power)
+
     result_state = (
         "no opportunity"
         if isinstance(res, str) and res.strip().lower() == "no opportunity"

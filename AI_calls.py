@@ -357,6 +357,29 @@ def daily_market_analysis(client, current_port, buying_power):
     Your goal:
     Determine which ticker represents the SINGLE BEST risk-adjusted LONG opportunity right now (30–180 days), or output "no opportunity".
 
+    IMPORTANT — Capital allocation & cash management rules:
+    - Do NOT deploy all available buying power into a single position by default.
+    - Capital preservation and optionality are priorities.
+    - You must assume that future, potentially superior opportunities may arise.
+
+    Allocation rules:
+    - Unless the portfolio is already well diversified across sectors and risk factors,
+    allocate only a PARTIAL position to any new trade.
+    - As a rule of thumb:
+    - Typical initial allocation: 20–40% of available buying power
+    - Maximum allocation to a single new position: 50% of available buying power
+    - Full deployment (near 100% of buying power) is allowed ONLY if:
+    - The portfolio is already diversified, AND
+    - No alternative opportunities exist, AND
+    - Market regime strongly favors concentration (clear risk-on, broad confirmation).
+
+    Decision rule:
+    - If the opportunity is attractive but not uniquely dominant, prefer a smaller allocation
+    and preserve cash for flexibility.
+    - If uncertainty exists about timing, volatility, or regime durability, reduce allocation.
+
+    The buy_in_quantity must reflect these allocation rules.
+
     STRICT TOOL RULES (MANDATORY):
     - You MUST call get_current_ticker_data at least once for EACH ticker in the list.
     - Buy order can't exceed available buying power, currently: {buying_power}
