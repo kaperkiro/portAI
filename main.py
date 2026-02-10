@@ -150,10 +150,6 @@ RUN_TIMES = [
     "10:00",
     "12:00",
     "15:00",
-    "14:25",
-    "14:30",
-    "14:32",
-    "14:35",
 ]  # local time; edit this list to change runs per day
 SMALL_TASK_INTERVAL_MINUTES = 1000  # change this to adjust the small task cadence
 # change this to us times maybe? as the alpaca only supports us stocks for some reason :/
