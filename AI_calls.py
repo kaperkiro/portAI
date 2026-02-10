@@ -203,7 +203,7 @@ def daily_port_analysis(current_port, client):
 
     grounding_tool = types.Tool(google_search=types.GoogleSearch())
     config = types.GenerateContentConfig(
-        # thinking_config=types.ThinkingConfig(thinking_level="high"),
+        thinking_config=types.ThinkingConfig(thinking_level="high"),
         tools=[grounding_tool],
         temperature=0.1,
     )
@@ -301,7 +301,7 @@ def daily_market_analysis(client, current_port, buying_power):
     # thinking_config=types.ThinkingConfig(thinking_level="high"),
     grounding_tool = types.Tool(google_search=types.GoogleSearch())
     config1 = types.GenerateContentConfig(
-        # thinking_config=types.ThinkingConfig(thinking_level="high"),
+        thinking_config=types.ThinkingConfig(thinking_level="high"),
         tools=[grounding_tool],
         temperature=0.1,
     )
@@ -436,7 +436,7 @@ def daily_market_analysis(client, current_port, buying_power):
     is sufficient return ok, if there is any other specific data you would generally need such as for example price history, or order volume, write it here)"""
 
     config2 = types.GenerateContentConfig(
-        # thinking_config=types.ThinkingConfig(thinking_level="high"),
+        thinking_config=types.ThinkingConfig(thinking_level="high"),
         tools=[get_current_ticker_data],
         temperature=0.1,
     )
