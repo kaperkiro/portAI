@@ -141,13 +141,19 @@ def analyzeAIResult(AIResult, trading_client):
         take_profit2 = {"limit_price": int(AIResult["take_profit_2"])}
         stop_loss = {"stop_price": int(AIResult["stop_loss"])}
         # place two order to simulate the double take profit levels:
-        api.bracketBuy(ticker, qty / 2, take_profit1, stop_loss, trading_client)
-        api.bracketBuy(ticker, qty / 2, take_profit2, stop_loss, trading_client)
+        if qty <= 1:
+            api.bracketBuy(ticker, qty, take_profit1, stop_loss, trading_client)
+        else:
+            api.bracketBuy(ticker, qty / 2, take_profit1, stop_loss, trading_client)
+            api.bracketBuy(ticker, qty / 2, take_profit2, stop_loss, trading_client)
     return
 
 
 RUN_TIMES = [
     "10:00",
+    "10:27",
+    "10:30",
+    "10:34",
     "12:00",
     "15:00",
 ]  # local time; edit this list to change runs per day
@@ -184,11 +190,15 @@ def _run_daily_tasks(client, alpaca_client) -> None:
     global _gemini_calls_today
     logger.info("Running daily task cycle")
     current_port_state = api.alpaca_portfolio_context(alpaca_client)
+    print("got portfolio")
     # ---- DAILY PORT ANALYSIS (Gemini call) ----
-    _check_gemini_rate_limit()
-    _gemini_calls_today += 1
-    daily_port_res = json.loads(AIC.daily_port_analysis(current_port_state, client))
-    handle_daily_sell(daily_port_res, alpaca_client)
+    # _check_gemini_rate_limit()
+    # _gemini_calls_today += 1
+    # daily_port_res_raw = AIC.daily_port_analysis(current_port_state, client)
+    # print(daily_port_res_raw)
+    # daily_port_res_json = json.loads(daily_port_res_raw)
+    # print(daily_port_res_json)
+    # handle_daily_sell(daily_port_res_json, alpaca_client)
     # ---- DAILY MARKET ANALYSIS (Gemini call) ----
     buying_power = api.get_portf_buying_power(alpaca_client)
     _check_gemini_rate_limit()

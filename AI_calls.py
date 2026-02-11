@@ -292,7 +292,8 @@ def daily_market_analysis(client, current_port, buying_power):
     If stocks ARE interesting, output EXACTLY in this 2-line format with no extra text:
 
     MARKET_CONTEXT: <one short paragraph, max 60 words>
-    TICKERS: <comma-separated list of ticker symbols in uppercase> (yfinance format)
+    TICKERS: <comma-separated list of ticker symbols in uppercase> 
+    (make sure tickers format are supported by yfinance python api)
 
     Example:
     MARKET_CONTEXT: Risk-on tone as rate fears ease; AI capex remains dominant; defensives lag; energy mixed; volatility moderate.
