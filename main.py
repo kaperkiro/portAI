@@ -4,6 +4,7 @@ import classes as cl
 from datetime import datetime, timedelta
 import time
 import json
+import ast
 import logging
 from google import genai
 import AI_calls as AIC
@@ -12,7 +13,7 @@ import api
 logger = logging.getLogger(__name__)
 
 # ===== Gemini rate limiting =====
-GEMINI_DAILY_LIMIT = 30
+GEMINI_DAILY_LIMIT = 100
 _gemini_calls_today = 0
 _gemini_day = datetime.now().date()
 
@@ -151,9 +152,6 @@ def analyzeAIResult(AIResult, trading_client):
 
 RUN_TIMES = [
     "10:00",
-    "10:27",
-    "10:30",
-    "10:34",
     "12:00",
     "15:00",
 ]  # local time; edit this list to change runs per day
@@ -190,15 +188,15 @@ def _run_daily_tasks(client, alpaca_client) -> None:
     global _gemini_calls_today
     logger.info("Running daily task cycle")
     current_port_state = api.alpaca_portfolio_context(alpaca_client)
-    print("got portfolio")
+    print(current_port_state)
     # ---- DAILY PORT ANALYSIS (Gemini call) ----
-    # _check_gemini_rate_limit()
-    # _gemini_calls_today += 1
-    # daily_port_res_raw = AIC.daily_port_analysis(current_port_state, client)
-    # print(daily_port_res_raw)
-    # daily_port_res_json = json.loads(daily_port_res_raw)
-    # print(daily_port_res_json)
-    # handle_daily_sell(daily_port_res_json, alpaca_client)
+    _check_gemini_rate_limit()
+    _gemini_calls_today += 1
+    daily_port_res_raw = AIC.daily_port_analysis(current_port_state, client)
+    print(daily_port_res_raw)
+    daily_port_res_json = ast.literal_eval(daily_port_res_raw)
+    print(daily_port_res_json)
+    handle_daily_sell(daily_port_res_json, alpaca_client)
     # ---- DAILY MARKET ANALYSIS (Gemini call) ----
     buying_power = api.get_portf_buying_power(alpaca_client)
     _check_gemini_rate_limit()

@@ -142,6 +142,7 @@ def daily_port_analysis(current_port, client):
         You MUST use Search to assess whether the market, sector,
         or company-specific environment has materially changed since entry.
         Your decisions must be grounded in current, externally verified information.
+        Only sell if it is worth breaking the original strategy as you believe it will fail, and selling will help to save the portfolio from losing more value.
 
         Input:
         You receive a portfolio object containing current holdings.
