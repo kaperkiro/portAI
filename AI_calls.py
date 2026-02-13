@@ -412,7 +412,7 @@ def daily_market_analysis(client, current_port, buying_power):
 
     {{
     "ticker": "STRING(Make sure ticker is in correct format for yahoo finance python api)",
-    "current_price": INTEGER,
+    "current_price": NUMBER,
     "current_price_date": "STRING",
     "buy_in_price": NUMBER,
     "stop_loss": NUMBER(put a stop loss for autoselling, so give some margin below the support level),
@@ -426,7 +426,7 @@ def daily_market_analysis(client, current_port, buying_power):
     - buy_in_ammount: currency amount to allocate (e.g. 150)
     - Prices must satisfy:
     stop_loss < buy_in_price < take_profit_1 < take_profit_2
-    - The output must be ONLY the object or the json "text":"no opportunity"
+    - If there is no opportunity the output must be ONLY the object or the json "text":"no opportunity"
 
     Tickers to analyze:
     {", ".join(tickers)}
