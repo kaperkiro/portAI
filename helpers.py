@@ -60,7 +60,7 @@ def _safe_str(x: Any) -> Optional[str]:
 def format_ticker_data_for_ai(
     info_filtered: Dict[str, Any],
     fast_filtered: Dict[str, Any],
-    # earnings: Dict[str, Any],
+    earnings: Dict[str, Any],
     analyst: Dict[str, Any],
     price_targets: Optional[Dict[str, Any]] = None,
     price_history: Optional[Dict[str, Any]] = None,
@@ -77,7 +77,7 @@ def format_ticker_data_for_ai(
         ("price_history", price_history or {}),
         ("nav_discount", nav_discount or {}),
         ("market_correlation", market_correlation or {}),
-        # ("earnings_event", earnings),
+        ("earnings_event", earnings),
         ("analyst_signal", analyst),
         ("analyst_price_targets", price_targets or {}),
     ]

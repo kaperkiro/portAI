@@ -151,13 +151,10 @@ def analyzeAIResult(AIResult, trading_client):
 
 
 RUN_TIMES = [
-    "09:56",
-    "10:08",
-    "10:15",
-    "11:10",
-    "12:00",
-    "12:13",
-    "15:00",
+    "10:23",
+    "17:30",
+    "19:30",
+    "22:00",
 ]  # local time; edit this list to change runs per day
 SMALL_TASK_INTERVAL_MINUTES = 1000  # change this to adjust the small task cadence
 # change this to us times maybe? as the alpaca only supports us stocks for some reason :/
@@ -203,7 +200,6 @@ def _run_daily_tasks(client, alpaca_client) -> None:
     _check_gemini_rate_limit()
     _gemini_calls_today += 1
     res = AIC.daily_market_analysis(client, current_port_state, buying_power)
-    print(res)
     result_state = (
         "no opportunity"
         if isinstance(res, str) and res.strip().lower() == "no opportunity"
