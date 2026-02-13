@@ -84,6 +84,7 @@ def get_current_ticker_data(ticker: str) -> str:
     nav_discount = hp.YFNavDiscountPremium.from_yfinance_info(
         data.info, data.fast_info
     ).to_dict()
+    print("testing 1")
     try:
         history_df = data.history(period="3mo", interval="1d")
     except Exception:
@@ -94,6 +95,7 @@ def get_current_ticker_data(ticker: str) -> str:
     except Exception:
         stock_hist_1y = None
 
+    print("testing 2")
     market_correlation = hp.YFMarketCorrelation.from_histories(
         stock_hist_1y,
         index_hist_1y,
@@ -105,6 +107,7 @@ def get_current_ticker_data(ticker: str) -> str:
     analyst = hp.YFAnalystSignal.from_recommendations(data.recommendations).to_dict()
 
     price_targets = data.get_analyst_price_targets()
+    print("testing 3")
 
     payload = hp.format_ticker_data_for_ai(
         info_filtered=info_filtered,
@@ -116,6 +119,7 @@ def get_current_ticker_data(ticker: str) -> str:
         analyst=analyst,
         price_targets=price_targets,
     )
+    print("testing 4")
     ticker_line = f"ticker: {str(ticker).upper()}"
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     as_of_line = f"as_of: {timestamp}"
