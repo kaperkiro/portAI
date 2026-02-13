@@ -152,7 +152,8 @@ def analyzeAIResult(AIResult, trading_client):
 
 RUN_TIMES = [
     "09:56",
-    "10:10",
+    "10:08",
+    "10:15",
     "11:10",
     "12:00",
     "12:13",
