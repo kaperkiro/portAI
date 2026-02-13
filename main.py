@@ -151,8 +151,13 @@ def analyzeAIResult(AIResult, trading_client):
 
 
 RUN_TIMES = [
-    "10:00",
+    "07:10",
+    "08:10",
+    "09:10",
+    "10:10",
+    "11:10",
     "12:00",
+    "12:13",
     "15:00",
 ]  # local time; edit this list to change runs per day
 SMALL_TASK_INTERVAL_MINUTES = 1000  # change this to adjust the small task cadence
@@ -186,23 +191,20 @@ def handle_daily_sell(stocks, alpaca_client):
 
 def _run_daily_tasks(client, alpaca_client) -> None:
     global _gemini_calls_today
-    logger.info("Running daily task cycle")
+    logger.info(f"Running daily task cycle with timestamp: {datetime.now()}")
     current_port_state = api.alpaca_portfolio_context(alpaca_client)
-    print(current_port_state)
     # ---- DAILY PORT ANALYSIS (Gemini call) ----
     _check_gemini_rate_limit()
     _gemini_calls_today += 1
     daily_port_res_raw = AIC.daily_port_analysis(current_port_state, client)
-    print(daily_port_res_raw)
     daily_port_res_json = ast.literal_eval(daily_port_res_raw)
-    print(daily_port_res_json)
     handle_daily_sell(daily_port_res_json, alpaca_client)
     # ---- DAILY MARKET ANALYSIS (Gemini call) ----
     buying_power = api.get_portf_buying_power(alpaca_client)
     _check_gemini_rate_limit()
     _gemini_calls_today += 1
     res = AIC.daily_market_analysis(client, current_port_state, buying_power)
-
+    print(res)
     result_state = (
         "no opportunity"
         if isinstance(res, str) and res.strip().lower() == "no opportunity"
