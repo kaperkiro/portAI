@@ -124,6 +124,7 @@ def get_current_ticker_data(ticker: str) -> str:
         if payload
         else f"{ticker_line}\n{as_of_line}"
     )
+    print(output)
     return output
 
 
@@ -287,6 +288,7 @@ def daily_market_analysis(client, current_port, buying_power):
     - Base conclusions only on recent, verifiable information
 
     Output rules (IMPORTANT):
+    Make sure the tickers are supported by the yfinance python api.
     If NO stocks are interesting, output exactly:
     no opportunity
 
@@ -294,7 +296,7 @@ def daily_market_analysis(client, current_port, buying_power):
 
     MARKET_CONTEXT: <one short paragraph, max 60 words>
     TICKERS: <comma-separated list of ticker symbols in uppercase> 
-    (make sure tickers format are supported by yfinance python api)
+    
 
     Example:
     MARKET_CONTEXT: Risk-on tone as rate fears ease; AI capex remains dominant; defensives lag; energy mixed; volatility moderate.
