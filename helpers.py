@@ -572,62 +572,189 @@ class YFMarketCorrelation:
 
 @dataclass(frozen=True)
 class YFEarningsEvent:
+    """
+    Stable, best-effort earnings event extractor.
+
+    Design goals:
+    - Accept multiple shapes (DataFrame/Series/dict-like/None) without raising.
+    - Prefer explicit earnings dates (index-based) when available.
+    - Fall back to calendar formats commonly returned by yfinance.
+    - Never crash the pipeline: returns (None, None) if unknown.
+    """
+
     earnings_date_iso: Optional[str]  # "YYYY-MM-DD"
     earnings_in_days: Optional[int]  # can be negative if already passed
 
     @staticmethod
+    def _to_timestamp_safe(x: Any) -> Optional[pd.Timestamp]:
+        """Convert a value to Timestamp safely; return None if not parseable."""
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return None
+        try:
+            ts = pd.to_datetime(x, errors="coerce")
+            if ts is pd.NaT or pd.isna(ts):
+                return None
+            # Some returns can be arrays/Index; grab first if so
+            if isinstance(ts, (pd.DatetimeIndex, pd.Index)):
+                if len(ts) == 0:
+                    return None
+                ts = ts[0]
+            return pd.Timestamp(ts)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _extract_from_earnings_dates(
+        earnings_dates: Any, today: pd.Timestamp
+    ) -> Optional[pd.Timestamp]:
+        """
+        Extract next earnings date from an earnings_dates-like object.
+        yfinance often returns a DataFrame with date index.
+        """
+        if earnings_dates is None:
+            return None
+
+        # DataFrame with date index
+        if isinstance(earnings_dates, pd.DataFrame) and not earnings_dates.empty:
+            try:
+                idx = pd.to_datetime(earnings_dates.index, errors="coerce")
+                idx = pd.DatetimeIndex([d for d in idx if d is not pd.NaT])
+                if len(idx) == 0:
+                    return None
+                # Normalize to dates (drop time/tz)
+                norm = (
+                    idx.tz_convert(None).normalize()
+                    if idx.tz is not None
+                    else idx.normalize()
+                )
+                future = norm[norm >= today]
+                return future.min() if len(future) else norm.min()
+            except Exception:
+                return None
+
+        # Series/Index of dates
+        if (
+            isinstance(earnings_dates, (pd.Series, pd.DatetimeIndex, pd.Index))
+            and len(earnings_dates) > 0
+        ):
+            try:
+                idx = pd.to_datetime(earnings_dates, errors="coerce")
+                idx = pd.DatetimeIndex([d for d in idx if d is not pd.NaT])
+                if len(idx) == 0:
+                    return None
+                norm = (
+                    idx.tz_convert(None).normalize()
+                    if idx.tz is not None
+                    else idx.normalize()
+                )
+                future = norm[norm >= today]
+                return future.min() if len(future) else norm.min()
+            except Exception:
+                return None
+
+        return None
+
+    @staticmethod
+    def _extract_from_calendar(calendar: Any) -> Optional[pd.Timestamp]:
+        """
+        Extract earnings date from calendar-like object.
+        yfinance calendar may be:
+          - DataFrame with index including "Earnings Date"
+          - DataFrame with column "Earnings Date"
+          - dict-like { "Earnings Date": ... }
+        """
+        if calendar is None:
+            return None
+
+        # dict-like
+        if isinstance(calendar, dict):
+            val = calendar.get("Earnings Date") or calendar.get("EarningsDate")
+            # Sometimes value can be list/tuple with start/end
+            if isinstance(val, (list, tuple)) and len(val) > 0:
+                val = val[0]
+            return YFEarningsEvent._to_timestamp_safe(val)
+
+        if isinstance(calendar, pd.DataFrame) and not calendar.empty:
+            try:
+                # Index contains "Earnings Date"
+                if "Earnings Date" in calendar.index:
+                    row = calendar.loc["Earnings Date"]
+                    # row can be Series; values may be [start,end] or scalar
+                    if hasattr(row, "values") and len(row.values) > 0:
+                        val = row.values[0]
+                        if isinstance(val, (list, tuple)) and len(val) > 0:
+                            val = val[0]
+                        return YFEarningsEvent._to_timestamp_safe(val)
+
+                # Column contains "Earnings Date"
+                if "Earnings Date" in calendar.columns:
+                    col = calendar["Earnings Date"].dropna()
+                    if not col.empty:
+                        val = col.iloc[0]
+                        if isinstance(val, (list, tuple)) and len(val) > 0:
+                            val = val[0]
+                        return YFEarningsEvent._to_timestamp_safe(val)
+            except Exception:
+                return None
+
+        # Series-like fallback
+        if isinstance(calendar, pd.Series):
+            try:
+                val = calendar.get("Earnings Date") or calendar.get("EarningsDate")
+                if isinstance(val, (list, tuple)) and len(val) > 0:
+                    val = val[0]
+                return YFEarningsEvent._to_timestamp_safe(val)
+            except Exception:
+                return None
+
+        return None
+
+    @staticmethod
     def from_calendar_or_earnings_dates(
-        calendar: Optional[pd.DataFrame] = None,
-        earnings_dates: Optional[pd.DataFrame] = None,
+        calendar: Optional[Union[pd.DataFrame, pd.Series, dict]] = None,
+        earnings_dates: Optional[Any] = None,
         *,
         today_utc: Optional[pd.Timestamp] = None,
     ) -> "YFEarningsEvent":
         """
         Best-effort extractor for the next earnings date.
         Provide either `earnings_dates` (preferred) or `calendar` (fallback).
+
+        Returns:
+          - earnings_date_iso: YYYY-MM-DD
+          - earnings_in_days: int (negative if already passed)
         """
-        today = (
-            today_utc if today_utc is not None else pd.Timestamp.utcnow().normalize()
-        )
+        try:
+            today = (
+                (today_utc if today_utc is not None else pd.Timestamp.utcnow())
+                .tz_localize(None)
+                .normalize()
+            )
+        except Exception:
+            today = pd.Timestamp.utcnow().normalize()
 
-        dt: Optional[pd.Timestamp] = None
+        # 1) Preferred: earnings_dates
+        dt = YFEarningsEvent._extract_from_earnings_dates(earnings_dates, today)
 
-        # Preferred: earnings_dates (index is dates)
-        if isinstance(earnings_dates, pd.DataFrame) and not earnings_dates.empty:
-            try:
-                # Index can be tz-aware; normalize
-                idx = pd.to_datetime(earnings_dates.index)
-                # choose the earliest date >= today, else earliest date overall
-                future = idx[idx.normalize() >= today]
-                dt = future.min() if len(future) else idx.min()
-            except Exception:
-                dt = None
+        # 2) Fallback: calendar
+        if dt is None:
+            dt = YFEarningsEvent._extract_from_calendar(calendar)
 
-        # Fallback: calendar
-        if dt is None and isinstance(calendar, pd.DataFrame) and not calendar.empty:
-            try:
-                # Common pattern: index contains "Earnings Date"
-                if "Earnings Date" in calendar.index:
-                    val = calendar.loc["Earnings Date"].values
-                    if len(val):
-                        dt = pd.to_datetime(val[0])
-                # Another pattern: column contains "Earnings Date"
-                elif "Earnings Date" in calendar.columns:
-                    val = calendar["Earnings Date"].dropna()
-                    if not val.empty:
-                        dt = pd.to_datetime(val.iloc[0])
-            except Exception:
-                dt = None
-
-        if dt is None or pd.isna(dt):
+        # Final normalize + compute
+        if dt is None:
             return YFEarningsEvent(None, None)
 
-        dt_norm = pd.to_datetime(dt).normalize()
-        days = int((dt_norm - today).days)
+        try:
+            dt_norm = pd.Timestamp(dt).tz_localize(None).normalize()
+        except Exception:
+            dt_norm = YFEarningsEvent._to_timestamp_safe(dt)
+            if dt_norm is None:
+                return YFEarningsEvent(None, None)
+            dt_norm = dt_norm.tz_localize(None).normalize()
 
+        days = int((dt_norm - today).days)
         return YFEarningsEvent(
-            earnings_date_iso=str(dt_norm.date()),
-            earnings_in_days=days,
+            earnings_date_iso=str(dt_norm.date()), earnings_in_days=days
         )
 
     def to_dict(self) -> Dict[str, Any]:
