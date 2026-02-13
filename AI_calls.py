@@ -101,10 +101,13 @@ def get_current_ticker_data(ticker: str) -> str:
         index_hist_1y,
         index_ticker=index,
     ).to_dict()
+    print("testing 2.1")
     earnings = hp.YFEarningsEvent.from_calendar_or_earnings_dates(
         data.calendar, data.earnings_dates
     ).to_dict()
+    print("testing 2.2")
     analyst = hp.YFAnalystSignal.from_recommendations(data.recommendations).to_dict()
+    print("testing 2.3")
 
     price_targets = data.get_analyst_price_targets()
     print("testing 3")
@@ -277,6 +280,7 @@ def daily_market_analysis(client, current_port, buying_power):
     - Large US equities only
     - Highly liquid stocks (no microcaps, no thin volume)
     - Avoid stocks with earnings within the next 7 calendar days unless the catalyst is earnings-driven
+    - Make sure the tickers are supported by the yfinance python api.
 
     Objective:
     Identify up to 5 stock tickers that offer the BEST incremental risk-adjusted swing trade
@@ -292,7 +296,6 @@ def daily_market_analysis(client, current_port, buying_power):
     - Base conclusions only on recent, verifiable information
 
     Output rules (IMPORTANT):
-    Make sure the tickers are supported by the yfinance python api.
     If NO stocks are interesting, output exactly:
     no opportunity
 
