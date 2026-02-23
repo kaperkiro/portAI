@@ -73,14 +73,17 @@ def get_current_ticker_data(ticker: str) -> str:
             yf.Ticker(index).history(period="1y", interval="1d") if index else None
         )
     except Exception:
+        print("failed on exchange")
         index_hist_1y = None
 
     logger.info("Ran ticker data with ticker: %s, with index: %s", ticker, index)
     # implement some error handling
     info_filtered = hp.YFInfoFundamentals.from_yfinance_info(data.info).to_dict()
+    print("testing 0.1")
     fast_filtered = hp.YFFastInfoSnapshot.from_yfinance_fast_info(
         data.fast_info
     ).to_dict()
+    print("testing 0.2")
     nav_discount = hp.YFNavDiscountPremium.from_yfinance_info(
         data.info, data.fast_info
     ).to_dict()
