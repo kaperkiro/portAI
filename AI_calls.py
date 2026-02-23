@@ -102,9 +102,9 @@ def get_current_ticker_data(ticker: str) -> str:
         index_ticker=index,
     ).to_dict()
     print("testing 2.1")
-    # earnings = hp.YFEarningsEvent.from_calendar_or_earnings_dates(
-    #    data.calendar, data.earnings_dates
-    # ).to_dict()
+    earnings = hp.YFEarningsEvent.from_calendar_or_earnings_dates(
+        data.calendar, data.earnings_dates
+    ).to_dict()
     print("testing 2.2")
     analyst = hp.YFAnalystSignal.from_recommendations(data.recommendations).to_dict()
     print("testing 2.3")
@@ -118,7 +118,7 @@ def get_current_ticker_data(ticker: str) -> str:
         price_history=price_history,
         nav_discount=nav_discount,
         market_correlation=market_correlation,
-        # earnings=earnings,
+        earnings=earnings,
         analyst=analyst,
         price_targets=price_targets,
     )
