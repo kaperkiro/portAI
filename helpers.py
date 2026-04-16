@@ -486,6 +486,8 @@ class YFMarketCorrelation:
             s = str(raw).strip()
             if s.startswith("^"):
                 s = s[1:]
+            if s.upper() == "WIG20.WA":
+                return "WIG20"
             return s or None
 
         def _interpret(corr: Optional[float], beta: Optional[float]) -> Optional[str]:
