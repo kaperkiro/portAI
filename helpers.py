@@ -66,6 +66,7 @@ def format_ticker_data_for_ai(
     price_history: Optional[Dict[str, Any]] = None,
     nav_discount: Optional[Dict[str, Any]] = None,
     market_correlation: Optional[Dict[str, Any]] = None,
+    relative_strength: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Combine filtered ticker data into a single, AI-friendly string.
@@ -77,6 +78,7 @@ def format_ticker_data_for_ai(
         ("price_history", price_history or {}),
         ("nav_discount", nav_discount or {}),
         ("market_correlation", market_correlation or {}),
+        ("relative_strength", relative_strength or {}),
         ("earnings_event", earnings),
         ("analyst_signal", analyst),
         ("analyst_price_targets", price_targets or {}),
@@ -565,6 +567,355 @@ class YFMarketCorrelation:
             "beta_6_12m": self.beta_6_12m,
             "interpretation": self.interpretation,
         }
+
+
+# -----------------------------
+# 5b) relative strength analysis (MRS, rolling beta/alpha, RRG)
+# -----------------------------
+
+
+@dataclass(frozen=True)
+class YFRelativeStrengthAnalysis:
+    """
+    Multi-algorithm relative strength of a stock vs its benchmark index.
+
+    Orientation: positive / above-100 = outperforming the index.
+      mrs_*                      > 0   → stock SMA-ratio beats index SMA-ratio
+      rolling_alpha_annualized_pct > 0 → excess annualised return above beta exposure
+      rrg_rs_ratio > 100               → smoothed outperformance vs benchmark
+      rrg_rs_momentum > 100            → degree of outperformance is accelerating
+      composite_score ∈ [−1, +1]      → negative = underperforming, positive = outperforming
+    """
+
+    index: Optional[str]
+
+    # --- Mansfield Relative Strength ---
+    # (stock / SMA_n(stock)) / (index / SMA_n(index)) − 1
+    mrs_4w: Optional[float]   # 20-day window  (≈ 4 trading weeks)
+    mrs_13w: Optional[float]  # 63-day window  (≈ 1 quarter)
+    mrs_52w: Optional[float]  # 252-day window (classic annual Mansfield period)
+
+    # --- Rolling OLS Beta & Alpha (last rolling_beta_window days, default 63) ---
+    rolling_beta_63d: Optional[float]
+    rolling_alpha_annualized_pct: Optional[float]  # daily alpha × 252 × 100, in %
+
+    # --- Relative Rotation Graph (RRG) ---
+    # rs_ratio    = EMA(rs_line, fast) / EMA(rs_line, slow) × 100
+    # rs_momentum = rs_ratio / EMA(rs_ratio, momentum_span) × 100
+    rrg_rs_ratio: Optional[float]
+    rrg_rs_momentum: Optional[float]
+    rrg_quadrant: Optional[str]  # "leading" | "weakening" | "lagging" | "improving"
+
+    # --- Summary ---
+    composite_score: Optional[float]  # weighted average of signals, −1 to +1
+    signal: Optional[str]  # "strong-outperform" | "outperform" | "neutral" | "underperform" | "strong-underperform"
+
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _get_close(df: pd.DataFrame) -> pd.Series:
+        for col in ("Adj Close", "Close"):
+            if col in df.columns:
+                return pd.to_numeric(df[col], errors="coerce").dropna()
+        for col in df.columns:
+            s = pd.to_numeric(df[col], errors="coerce")
+            if s.notna().any():
+                return s.dropna()
+        return pd.Series(dtype=float)
+
+    @staticmethod
+    def _mansfield_rs(
+        stock_close: pd.Series,
+        index_close: pd.Series,
+        window: int,
+    ) -> Optional[float]:
+        """
+        Mansfield RS for one lookback window.
+        MRS = (S / SMA_n(S)) / (I / SMA_n(I)) − 1
+        """
+        n = min(window, len(stock_close), len(index_close))
+        if n < 2:
+            return None
+        try:
+            s_sma = stock_close.rolling(n, min_periods=n).mean()
+            i_sma = index_close.rolling(n, min_periods=n).mean()
+            mrs = (stock_close / s_sma) / (index_close / i_sma) - 1.0
+            val = mrs.iloc[-1]
+            return _round_opt(val, 4) if pd.notna(val) else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _rolling_beta_alpha(
+        stock_ret: pd.Series,
+        index_ret: pd.Series,
+        window: int,
+    ) -> tuple[Optional[float], Optional[float]]:
+        """
+        OLS beta and annualised alpha over the last `window` daily returns.
+        Returns (beta, alpha_annualized_pct).
+        """
+        recent = pd.concat([stock_ret, index_ret], axis=1).dropna().tail(window)
+        if len(recent) < max(20, window // 3):
+            return None, None
+        try:
+            s = recent.iloc[:, 0]
+            idx = recent.iloc[:, 1]
+            var_idx = idx.var()
+            if var_idx == 0 or pd.isna(var_idx):
+                return None, None
+            beta = s.cov(idx) / var_idx
+            alpha_daily = s.mean() - beta * idx.mean()
+            alpha_ann_pct = alpha_daily * 252.0 * 100.0
+            return (
+                _round_opt(beta, 3) if pd.notna(beta) else None,
+                _round_opt(alpha_ann_pct, 2) if pd.notna(alpha_ann_pct) else None,
+            )
+        except Exception:
+            return None, None
+
+    @staticmethod
+    def _rrg_metrics(
+        stock_close: pd.Series,
+        index_close: pd.Series,
+        rrg_fast: int,
+        rrg_slow: int,
+        rrg_momentum_span: int,
+    ) -> tuple[Optional[float], Optional[float], Optional[str]]:
+        """
+        RRG RS-Ratio, RS-Momentum, and quadrant.
+
+        rs_line     = stock / index
+        rs_ratio    = EMA(rs_line, fast) / EMA(rs_line, slow) × 100
+        rs_momentum = rs_ratio / EMA(rs_ratio, momentum_span) × 100
+
+        Quadrants (centred on 100/100):
+          leading   – rs_ratio > 100 and rs_momentum > 100
+          weakening – rs_ratio > 100 and rs_momentum ≤ 100
+          lagging   – rs_ratio ≤ 100 and rs_momentum ≤ 100
+          improving – rs_ratio ≤ 100 and rs_momentum > 100
+        """
+        min_len = rrg_slow + rrg_momentum_span + 5
+        if len(stock_close) < min_len or len(index_close) < min_len:
+            return None, None, None
+        try:
+            rs_line = (stock_close / index_close).dropna()
+            if len(rs_line) < min_len:
+                return None, None, None
+
+            ema_fast = rs_line.ewm(span=rrg_fast, adjust=False).mean()
+            ema_slow = rs_line.ewm(span=rrg_slow, adjust=False).mean()
+            rs_ratio = (ema_fast / ema_slow) * 100.0
+
+            ema_momentum = rs_ratio.ewm(span=rrg_momentum_span, adjust=False).mean()
+            rs_momentum = (rs_ratio / ema_momentum) * 100.0
+
+            rsr = rs_ratio.iloc[-1]
+            rsm = rs_momentum.iloc[-1]
+            if pd.isna(rsr) or pd.isna(rsm):
+                return None, None, None
+
+            if rsr > 100.0 and rsm > 100.0:
+                quadrant = "leading"
+            elif rsr > 100.0:
+                quadrant = "weakening"
+            elif rsm > 100.0:
+                quadrant = "improving"
+            else:
+                quadrant = "lagging"
+
+            return _round_opt(rsr, 2), _round_opt(rsm, 2), quadrant
+        except Exception:
+            return None, None, None
+
+    @staticmethod
+    def _composite(
+        mrs_52w: Optional[float],
+        alpha_pct: Optional[float],
+        rrg_quadrant: Optional[str],
+    ) -> tuple[Optional[float], Optional[str]]:
+        """
+        Combine three signals into a composite score in [−1, +1].
+        Weights: MRS 40 %, Alpha 30 %, RRG 30 %.
+        """
+        scores: List[tuple[float, float]] = []  # (score, weight)
+
+        if mrs_52w is not None:
+            # Clip ±20 % MRS before normalising to ±1
+            s = max(-1.0, min(1.0, mrs_52w / 0.20))
+            scores.append((s, 0.40))
+
+        if alpha_pct is not None:
+            # Clip ±10 % annualised alpha before normalising
+            s = max(-1.0, min(1.0, alpha_pct / 10.0))
+            scores.append((s, 0.30))
+
+        if rrg_quadrant is not None:
+            quad_score = {
+                "leading": 1.0,
+                "improving": 0.33,
+                "weakening": -0.33,
+                "lagging": -1.0,
+            }.get(rrg_quadrant, 0.0)
+            scores.append((quad_score, 0.30))
+
+        if not scores:
+            return None, None
+
+        total_weight = sum(w for _, w in scores)
+        composite = sum(s * w for s, w in scores) / total_weight
+        composite = round(max(-1.0, min(1.0, composite)), 3)
+
+        if composite >= 0.6:
+            signal = "strong-outperform"
+        elif composite >= 0.2:
+            signal = "outperform"
+        elif composite > -0.2:
+            signal = "neutral"
+        elif composite > -0.6:
+            signal = "underperform"
+        else:
+            signal = "strong-underperform"
+
+        return composite, signal
+
+    @classmethod
+    def from_histories(
+        cls,
+        stock_history: Optional[pd.DataFrame],
+        index_history: Optional[pd.DataFrame],
+        *,
+        index_ticker: str,
+        mrs_windows: tuple[int, int, int] = (20, 63, 252),
+        rolling_beta_window: int = 63,
+        rrg_fast: int = 10,
+        rrg_slow: int = 40,
+        rrg_momentum_span: int = 4,
+    ) -> "YFRelativeStrengthAnalysis":
+        """
+        Compute all relative-strength metrics from yfinance history DataFrames.
+
+        Parameters
+        ----------
+        stock_history, index_history
+            yfinance DataFrames containing 'Close' or 'Adj Close'.
+        index_ticker
+            Benchmark label, e.g. "^GSPC" or "WIG20.WA".
+        mrs_windows
+            Lookback periods (trading days) for Mansfield RS. Default (20, 63, 252).
+        rolling_beta_window
+            OLS window in trading days. Default 63 (≈ 3 months).
+        rrg_fast, rrg_slow, rrg_momentum_span
+            EMA spans for RRG. Defaults: 10, 40, 4.
+        """
+        s = str(index_ticker).strip()
+        index_label: Optional[str] = (s[1:] if s.startswith("^") else s).upper() or None
+
+        _empty = cls(
+            index=index_label,
+            mrs_4w=None, mrs_13w=None, mrs_52w=None,
+            rolling_beta_63d=None, rolling_alpha_annualized_pct=None,
+            rrg_rs_ratio=None, rrg_rs_momentum=None, rrg_quadrant=None,
+            composite_score=None, signal=None,
+        )
+
+        if (
+            not isinstance(stock_history, pd.DataFrame) or stock_history.empty
+            or not isinstance(index_history, pd.DataFrame) or index_history.empty
+        ):
+            return _empty
+
+        try:
+            stock_close = cls._get_close(stock_history)
+            index_close = cls._get_close(index_history)
+
+            if stock_close.empty or index_close.empty:
+                return _empty
+
+            # Align on shared dates
+            aligned = pd.concat(
+                [stock_close.rename("s"), index_close.rename("i")], axis=1
+            ).dropna()
+            if len(aligned) < 20:
+                return _empty
+
+            sc = aligned["s"]
+            ic = aligned["i"]
+
+            # MRS
+            w4, w13, w52 = mrs_windows
+            mrs_4w = cls._mansfield_rs(sc, ic, w4)
+            mrs_13w = cls._mansfield_rs(sc, ic, w13)
+            mrs_52w = cls._mansfield_rs(sc, ic, w52)
+
+            # Rolling beta / alpha
+            s_ret = sc.pct_change().dropna()
+            i_ret = ic.pct_change().dropna()
+            beta, alpha_ann_pct = cls._rolling_beta_alpha(s_ret, i_ret, rolling_beta_window)
+
+            # RRG
+            rsr, rsm, quadrant = cls._rrg_metrics(sc, ic, rrg_fast, rrg_slow, rrg_momentum_span)
+
+            # Composite
+            composite, signal = cls._composite(mrs_52w, alpha_ann_pct, quadrant)
+
+            return cls(
+                index=index_label,
+                mrs_4w=mrs_4w,
+                mrs_13w=mrs_13w,
+                mrs_52w=mrs_52w,
+                rolling_beta_63d=beta,
+                rolling_alpha_annualized_pct=alpha_ann_pct,
+                rrg_rs_ratio=rsr,
+                rrg_rs_momentum=rsm,
+                rrg_quadrant=quadrant,
+                composite_score=composite,
+                signal=signal,
+            )
+        except Exception:
+            return _empty
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def compute_relative_strength(
+    stock_history: Optional[pd.DataFrame],
+    index_history: Optional[pd.DataFrame],
+    *,
+    index_ticker: str,
+    mrs_windows: tuple[int, int, int] = (20, 63, 252),
+    rolling_beta_window: int = 63,
+    rrg_fast: int = 10,
+    rrg_slow: int = 40,
+    rrg_momentum_span: int = 4,
+) -> YFRelativeStrengthAnalysis:
+    """
+    Convenience wrapper — call this directly without touching the dataclass.
+
+    Can be used standalone (notebooks, scripts) or inside get_current_ticker_data.
+
+    Example
+    -------
+    >>> import yfinance as yf
+    >>> from helpers import compute_relative_strength
+    >>> rs = compute_relative_strength(
+    ...     yf.Ticker("AAPL").history(period="1y"),
+    ...     yf.Ticker("^GSPC").history(period="1y"),
+    ...     index_ticker="^GSPC",
+    ... )
+    >>> print(rs.signal, rs.composite_score)
+    """
+    return YFRelativeStrengthAnalysis.from_histories(
+        stock_history,
+        index_history,
+        index_ticker=index_ticker,
+        mrs_windows=mrs_windows,
+        rolling_beta_window=rolling_beta_window,
+        rrg_fast=rrg_fast,
+        rrg_slow=rrg_slow,
+        rrg_momentum_span=rrg_momentum_span,
+    )
 
 
 # -----------------------------

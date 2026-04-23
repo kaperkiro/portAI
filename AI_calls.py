@@ -318,8 +318,14 @@ def get_current_ticker_data(ticker: str) -> str:
         stock_hist_1y = None
 
     market_correlation = None
+    relative_strength = None
     if index:
         market_correlation = hp.YFMarketCorrelation.from_histories(
+            stock_hist_1y,
+            index_hist_1y,
+            index_ticker=index,
+        ).to_dict()
+        relative_strength = hp.compute_relative_strength(
             stock_hist_1y,
             index_hist_1y,
             index_ticker=index,
@@ -354,6 +360,7 @@ def get_current_ticker_data(ticker: str) -> str:
         price_history=price_history,
         nav_discount=nav_discount,
         market_correlation=market_correlation,
+        relative_strength=relative_strength,
         earnings=earnings,
         analyst=analyst,
         price_targets=price_targets,
@@ -381,6 +388,7 @@ def get_current_ticker_data(ticker: str) -> str:
         lines.append(f"quote_type: {quote_type}")
     if payload:
         lines.append(payload)
+    print(payload)
     return "\n".join(lines)
 
 
