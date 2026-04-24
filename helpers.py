@@ -1305,3 +1305,47 @@ class YFAnalystSignal:
 #   actions = YFCorporateActions.from_actions_dividends_splits(actions_df, dividends_series, splits_series).to_dict()
 #   analyst = YFAnalystSignal.from_recommendations(recs_df).to_dict()
 # -----------------------------
+
+
+import math as _math
+
+
+def compute_ex_ante_sharpe(
+    entry: float,
+    stop_loss: float,
+    tp1: float,
+    tp2: float,
+    atr_14: float,
+    win_rate: float = 0.50,
+    risk_free_annual: float = 0.045,
+) -> Optional[float]:
+    """
+    Ex-ante Sharpe ratio for a defined-risk LONG swing trade.
+
+    Expected return is probability-weighted using win_rate (default 50%).
+    Volatility is scaled from ATR over an estimated holding period
+    (days to TP1 at ~1 ATR/day pace).
+
+    Returns None if inputs are invalid or degenerate.
+    """
+    try:
+        risk = entry - stop_loss
+        avg_reward = ((tp1 - entry) + (tp2 - entry)) / 2.0
+
+        if risk <= 0 or avg_reward <= 0 or atr_14 <= 0 or entry <= 0:
+            return None
+
+        expected_return_pct = (win_rate * avg_reward - (1.0 - win_rate) * risk) / entry
+
+        daily_vol = atr_14 / entry
+        est_holding_days = max(1.0, (tp1 - entry) / atr_14)
+
+        rf_period = (risk_free_annual / 252.0) * est_holding_days
+        period_vol = daily_vol * _math.sqrt(est_holding_days)
+
+        if period_vol <= 0:
+            return None
+
+        return round((expected_return_pct - rf_period) / period_vol, 3)
+    except Exception:
+        return None

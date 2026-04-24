@@ -8,6 +8,7 @@ from google.genai import types
 
 import classes as cl
 import helpers as hp
+from helpers import compute_ex_ante_sharpe
 
 
 INDEX_MAP = {
@@ -388,7 +389,6 @@ def get_current_ticker_data(ticker: str) -> str:
         lines.append(f"quote_type: {quote_type}")
     if payload:
         lines.append(payload)
-    print(payload)
     return "\n".join(lines)
 
 
@@ -821,6 +821,9 @@ def single_stock_analysis(stock_query: str, client) -> str:
     - Keep the conclusion balanced, practical, and concise
     - For the upside/downside fields, list distinct catalysts, conditions, or decisions in short plain language
     - Keep each upside/downside field to one concrete idea, not a paragraph
+    - After determining all trade levels, call compute_ex_ante_sharpe with the proposed entry, stop_loss,
+      take_profit_1, take_profit_2, and atr_14 values. Use the result as SHARPE_RATIO.
+      If BIAS is UNSURE, set SHARPE_RATIO to UNSURE.
 
     Output EXACTLY in this line-based format with no markdown:
     QUERY: <user query>
@@ -829,6 +832,7 @@ def single_stock_analysis(stock_query: str, client) -> str:
     BIAS: <BULLISH, BEARISH, or UNSURE>
     TRADE_DIRECTION: <LONG, SHORT, or UNSURE>
     CONFIDENCE: <integer 1-10>
+    SHARPE_RATIO: <number (ex-ante Sharpe from compute_ex_ante_sharpe) or UNSURE>
     CURRENT_PRICE: <number>
     CURRENT_PRICE_DATE: <string>
     ENTRY_LEVEL: <number or UNSURE>
@@ -860,7 +864,7 @@ def single_stock_analysis(stock_query: str, client) -> str:
     """.strip()
 
     config2 = types.GenerateContentConfig(
-        tools=[get_current_ticker_data],
+        tools=[get_current_ticker_data, compute_ex_ante_sharpe],
         temperature=0.1,
         thinking_config=types.ThinkingConfig(thinking_level="high"),
     )
@@ -885,7 +889,7 @@ def single_stock_analysis(stock_query: str, client) -> str:
 
 
 def daily_market_analysis(
-    client, current_port: str | None = None, buying_power=None
+    client, current_port: str | None = None, market="US, Swedish and polish", buying_power=None
 ):
     logger.info("Running daily market analysis")
 
@@ -895,6 +899,7 @@ def daily_market_analysis(
         IMPORTANT — Current portfolio context:
         {current_port}
         """.strip()
+    print(market)
 
     prompt1 = f"""
     You are a professional portfolio manager and short-term swing trader (3-6 months).
@@ -909,13 +914,13 @@ def daily_market_analysis(
 
 
     Universe:
-    - US, Swedish and Polish equities only
+    - {market} equities only
     - Highly liquid stocks (no microcaps, no thin volume)
     - Avoid stocks with earnings within the next 7 calendar days unless the catalyst is earnings-driven
     - Make sure the tickers are supported by the yfinance python api
 
     Objective:
-    Identify up to 5 stock tickers that offer the BEST incremental risk-adjusted swing trade
+    Identify up to 10 stock tickers that offer the BEST incremental risk-adjusted swing trade
     opportunities over the next 30-180 days.
 
     Rules:
@@ -995,7 +1000,7 @@ def daily_market_analysis(
     - If you cannot retrieve valid data for a ticker, discard it
     - Do NOT invent prices or levels
     - Use the retrieved current price and date in your final output
-    {buying_power_line}
+    
 
     Analysis requirements:
     - Validate catalyst plausibility from market context
@@ -1009,8 +1014,13 @@ def daily_market_analysis(
     - stop_loss must be a real invalidation level, not arbitrary
     - take_profit_1 and take_profit_2 must be realistic from ATR or structure and give favorable reward to risk
     - Only LONG ideas unless explicitly asked for shorts
-    
-    
+
+    Sharpe ranking:
+    - After determining trade levels for each viable ticker, call compute_ex_ante_sharpe(entry, stop_loss,
+      tp1, tp2, atr_14) to get the ex-ante Sharpe ratio for that setup
+    - Use the Sharpe ratio as the primary ranking signal when confidence levels are equal or close:
+      prefer higher Sharpe setups as they offer better risk-adjusted return
+    - Discard setups with a negative Sharpe ratio unless no alternatives exist
 
     Output rules:
     - If NO high-quality opportunity exists after checking all tickers, output exactly:
@@ -1026,8 +1036,10 @@ def daily_market_analysis(
     "stop_loss": NUMBER,
     "take_profit_1": NUMBER,
     "take_profit_2": NUMBER,
-    "buy_in_quantity": INTEGER
-    "Confidence" : INTEGER (num from 0-10)
+    "buy_in_quantity": INTEGER,
+    "Confidence": INTEGER (num from 0-10),
+    "atr_14": NUMBER (the 14-period ATR value as returned by get_current_ticker_data for this ticker),
+    "sharpe_ratio": NUMBER (the ex-ante Sharpe ratio as returned by compute_ex_ante_sharpe for this ticker)
     }}
 
     Constraints:
@@ -1039,7 +1051,7 @@ def daily_market_analysis(
     """.strip()
 
     config2 = types.GenerateContentConfig(
-        tools=[get_current_ticker_data],
+        tools=[get_current_ticker_data, compute_ex_ante_sharpe],
         temperature=0.1,
         thinking_config=types.ThinkingConfig(thinking_level="high"),
     )

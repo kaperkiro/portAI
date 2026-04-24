@@ -12,6 +12,7 @@ from google import genai
 import AI_calls as AIC
 import api
 import classes as cl
+import helpers as hp
 
 
 logger = logging.getLogger(__name__)
@@ -101,15 +102,55 @@ def analyzeAIResult(ai_result, trading_client):
         "take_profit_1",
         "take_profit_2",
         "stop_loss",
+        "atr_14",
     }
     if not required_keys.issubset(ai_result.keys()):
+        logger.warning(
+            "analyzeAIResult: missing required keys %s",
+            required_keys - ai_result.keys(),
+        )
         return
 
     ticker = ai_result["ticker"]
     qty = ai_result["buy_in_quantity"]
-    take_profit1 = {"limit_price": int(ai_result["take_profit_1"])}
-    take_profit2 = {"limit_price": int(ai_result["take_profit_2"])}
-    stop_loss = {"stop_price": int(ai_result["stop_loss"])}
+    buy_in_price = float(ai_result.get("buy_in_price", ai_result.get("current_price", 0)))
+    stop_loss_price = float(ai_result["stop_loss"])
+    tp1_price = float(ai_result["take_profit_1"])
+    tp2_price = float(ai_result["take_profit_2"])
+    atr_14 = float(ai_result["atr_14"])
+
+    SHARPE_MIN = 0.5
+    sharpe = hp.compute_ex_ante_sharpe(
+        entry=buy_in_price,
+        stop_loss=stop_loss_price,
+        tp1=tp1_price,
+        tp2=tp2_price,
+        atr_14=atr_14,
+    )
+    if sharpe is None:
+        logger.warning(
+            "[SKIP] %s: ex-ante Sharpe could not be computed (degenerate levels) — skipping trade",
+            ticker,
+        )
+        return
+    if sharpe < SHARPE_MIN:
+        logger.info(
+            "[SKIP] %s: ex-ante Sharpe %.3f below threshold %.2f — skipping trade",
+            ticker,
+            sharpe,
+            SHARPE_MIN,
+        )
+        return
+    logger.info(
+        "[PASS] %s: ex-ante Sharpe %.3f >= %.2f — proceeding with trade",
+        ticker,
+        sharpe,
+        SHARPE_MIN,
+    )
+
+    take_profit1 = {"limit_price": int(tp1_price)}
+    take_profit2 = {"limit_price": int(tp2_price)}
+    stop_loss = {"stop_price": int(stop_loss_price)}
 
     if qty <= 1:
         api.bracketBuy(ticker, qty, take_profit1, stop_loss, trading_client)
@@ -186,8 +227,9 @@ def _run_small_tasks() -> None:
 
 def _run_daily_market_analysis_once() -> None:
     _setup_logging()
+    market = input("Choose market(eg US, SWE, POL): ")
     client = _build_gemini_client()
-    print(AIC.daily_market_analysis(client))
+    print(AIC.daily_market_analysis(client, market=market))
 
 
 def _run_single_stock_analysis_once(stock_query: str) -> None:
