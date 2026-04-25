@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import json
 import re
 import logging
 import textwrap
@@ -318,6 +319,9 @@ def get_current_ticker_data(ticker: str) -> str:
     except Exception:
         stock_hist_1y = None
 
+    # MA summary uses 1y history for SMA200; falls back gracefully with less data
+    ma_summary = hp.YFMovingAverageSummary.from_history(stock_hist_1y).to_dict()
+
     market_correlation = None
     relative_strength = None
     if index:
@@ -351,7 +355,12 @@ def get_current_ticker_data(ticker: str) -> str:
     price_targets = None
     if not price_history_only:
         try:
-            price_targets = data.get_analyst_price_targets()
+            raw_targets = data.get_analyst_price_targets()
+            # Normalize to plain dict regardless of whether yfinance returns Series or dict
+            if hasattr(raw_targets, "to_dict"):
+                price_targets = raw_targets.to_dict()
+            elif isinstance(raw_targets, dict):
+                price_targets = raw_targets
         except Exception:
             price_targets = None
 
@@ -359,6 +368,7 @@ def get_current_ticker_data(ticker: str) -> str:
         info_filtered=info_filtered,
         fast_filtered=fast_filtered,
         price_history=price_history,
+        ma_summary=ma_summary,
         nav_discount=nav_discount,
         market_correlation=market_correlation,
         relative_strength=relative_strength,
@@ -428,11 +438,12 @@ def daily_port_analysis(current_port, client):
         analyze whether any positions should be SOLD or PARTIALLY SOLD today.
 
         Recommend a sell ONLY if Google Search confirms at least one of the following:
-        - market regime has shifted
-        - sector or industry has entered sustained underperformance
-        - new macro, regulatory, earnings, or company-specific risks exist
-        - the original investment thesis is materially weakened
-        - portfolio-level risk reduction is justified due to external conditions
+        - market regime has shifted against the position's directional bias
+        - sector or industry has entered sustained underperformance or bearish rotation
+        - new macro, regulatory, earnings, or company-specific risks materially change the outlook
+        - the original investment thesis is broken (not just tested — broken)
+        - a stop-loss level has been structurally violated even if the bracket hasn't triggered
+        - portfolio-level correlation risk has risen sharply (multiple holdings now tracking same factor)
 
         Rules:
         - Do NOT guess prices or fabricate data.
@@ -790,9 +801,9 @@ def single_stock_analysis(stock_query: str, client) -> str:
     instrument_type = step1_payload.get("INSTRUMENT_TYPE", "")
 
     prompt2 = f"""
-    You are a market research assistant preparing a concise directional trade setup for a human investor.
+    You are a swing trader preparing a directional trade setup (30–180 day horizon) for a human investor.
 
-    Search findings from the first model call:
+    Search findings from Step 1:
     QUERY: {step1_payload.get("QUERY", normalized_query)}
     TICKER: {ticker}
     COMPANY: {company}
@@ -802,28 +813,53 @@ def single_stock_analysis(stock_query: str, client) -> str:
     RECENT_CATALYSTS: {step1_payload.get("RECENT_CATALYSTS", "")}
     KEY_RISKS: {step1_payload.get("KEY_RISKS", "")}
 
-    Your task:
-    - Analyze this single instrument using the search findings above
-    - The instrument may be a stock, ETF, commodity future, or index proxy
-    - You MUST call get_current_ticker_data exactly once for ticker {ticker}
-    - Combine the search findings with the live ticker data from the tool
-    - Return your own conclusion about the asset for a 30-180 day investor
-    - Provide actionable levels when the setup is clear enough
+    Step 1: Call get_current_ticker_data exactly once for ticker {ticker}.
 
-    Rules:
-    - Do not invent missing data
-    - Use the tool output as authoritative for current price/date and any available fundamentals or market context
-    - If the asset is not an operating company, do not force earnings-style reasoning
-    - Use price history, ATR, recent bars, and nearby range structure to anchor levels
-    - If the setup is bullish, give LONG levels
-    - If the setup is bearish, give SHORT levels
-    - If the setup is not clear enough, output UNSURE and explain why instead of forcing a trade
-    - Keep the conclusion balanced, practical, and concise
-    - For the upside/downside fields, list distinct catalysts, conditions, or decisions in short plain language
-    - Keep each upside/downside field to one concrete idea, not a paragraph
-    - After determining all trade levels, call compute_ex_ante_sharpe with the proposed entry, stop_loss,
-      take_profit_1, take_profit_2, and atr_14 values. Use the result as SHARPE_RATIO.
-      If BIAS is UNSURE, set SHARPE_RATIO to UNSURE.
+    Step 2: Extract these fields from the tool result to inform your analysis:
+      price_history   → last_close, atr_14, atr_14_pct, range_20d_high, range_20d_low,
+                        close_vs_20d_high_pct, volume_ratio_vs_20d, recent_bars_10d
+      relative_strength → signal, composite_score, rrg_quadrant, mrs_52w, rolling_alpha_annualized_pct
+      market_correlation → interpretation, beta_6_12m
+      fundamentals     → sector, beta, forward_pe, revenue_growth_pct, earnings_growth_pct
+      earnings_event   → earnings_date_iso, earnings_in_days
+
+    Step 3: Determine BIAS using the weight of evidence:
+      BULLISH signals: uptrend (price near range_20d_high), rrg_quadrant "leading"/"improving",
+                       composite_score > 0, positive recent catalysts, strong earnings momentum
+      BEARISH signals: downtrend (price near range_20d_low), rrg_quadrant "lagging"/"weakening",
+                       composite_score < 0, deteriorating fundamentals, negative catalysts
+      Mark UNSURE if signals conflict materially or data is insufficient
+
+    Step 4: Set levels using this methodology:
+
+      LONG setup (BULLISH):
+        Entry:      At or just above nearest support / pullback level; within 2% of last_close
+                    For a breakout setup: consolidation high + 0.1×atr_14
+        Stop-loss:  Below the most recent swing low OR 2.0×atr_14 below entry — use whichever is TIGHTER
+                    Absolute max distance: 2.5×atr_14 below entry
+        TP1:        Nearer of (next significant resistance / 52-week high area) OR (2.0×risk above entry)
+        TP2:        Measured move OR 3.0×risk above entry
+        Required:   (TP1 − entry) / (entry − stop) ≥ 2.0; if impossible, set BIAS = UNSURE
+
+      SHORT setup (BEARISH):
+        Entry:      At or just below nearest resistance; within 2% of last_close
+        Stop-loss:  Above the most recent swing high OR 2.0×atr_14 above entry — TIGHTER wins
+        TP1:        Nearer of (next significant support) OR (2.0×risk below entry)
+        TP2:        Measured move OR 3.0×risk below entry
+        Required:   (entry − TP1) / (stop − entry) ≥ 2.0; if impossible, set BIAS = UNSURE
+
+      For non-equity instruments (commodity futures, ETFs): apply the same ATR-based methodology;
+      do not force earnings-style reasoning where it does not apply.
+
+    Step 5: Call compute_ex_ante_sharpe(entry, stop_loss, take_profit_1, take_profit_2, atr_14).
+            Use the result as SHARPE_RATIO. If BIAS is UNSURE, set SHARPE_RATIO to UNSURE.
+
+    UPSIDE fields: each must be one specific, concrete catalyst or condition that would push price
+                   higher (e.g., "earnings beat triggers analyst upgrades", "breakout above $X resistance").
+                   Do NOT write generic statements.
+
+    DOWNSIDE fields: each must be one specific risk or condition that would invalidate the setup
+                     (e.g., "macro headwinds drag sector rotation", "stop triggered below $X swing low").
 
     Output EXACTLY in this line-based format with no markdown:
     QUERY: <user query>
@@ -832,34 +868,31 @@ def single_stock_analysis(stock_query: str, client) -> str:
     BIAS: <BULLISH, BEARISH, or UNSURE>
     TRADE_DIRECTION: <LONG, SHORT, or UNSURE>
     CONFIDENCE: <integer 1-10>
-    SHARPE_RATIO: <number (ex-ante Sharpe from compute_ex_ante_sharpe) or UNSURE>
+    SHARPE_RATIO: <number from compute_ex_ante_sharpe, or UNSURE>
     CURRENT_PRICE: <number>
     CURRENT_PRICE_DATE: <string>
     ENTRY_LEVEL: <number or UNSURE>
     STOP_LOSS_LEVEL: <number or UNSURE>
     TAKE_PROFIT_1: <number or UNSURE>
     TAKE_PROFIT_2: <number or UNSURE>
-    LEVELS_RATIONALE: <max 90 words explaining why those levels make sense>
+    LEVELS_RATIONALE: <max 90 words: reference specific ATR multiples, swing lows/highs, or resistance levels>
 
-    CONCLUSION: <max 120 words>
-    UPSIDE_1: <short phrase, max 16 words>
-    UPSIDE_2: <short phrase, max 16 words>
-    UPSIDE_3: <short phrase, max 16 words>
-    UPSIDE_4: <short phrase, max 16 words>
-    UPSIDE_5: <short phrase, max 16 words>
-    DOWNSIDE_1: <short phrase, max 16 words>
-    DOWNSIDE_2: <short phrase, max 16 words>
-    DOWNSIDE_3: <short phrase, max 16 words>
-    DOWNSIDE_4: <short phrase, max 16 words>
-    DOWNSIDE_5: <short phrase, max 16 words>
+    CONCLUSION: <max 120 words: regime alignment, relative strength signal, catalyst, and setup quality>
+    UPSIDE_1: <concrete catalyst, max 16 words>
+    UPSIDE_2: <concrete catalyst, max 16 words>
+    UPSIDE_3: <concrete catalyst, max 16 words>
+    UPSIDE_4: <concrete catalyst, max 16 words>
+    UPSIDE_5: <concrete catalyst, max 16 words>
+    DOWNSIDE_1: <concrete risk, max 16 words>
+    DOWNSIDE_2: <concrete risk, max 16 words>
+    DOWNSIDE_3: <concrete risk, max 16 words>
+    DOWNSIDE_4: <concrete risk, max 16 words>
+    DOWNSIDE_5: <concrete risk, max 16 words>
 
     Level rules:
-    - If BIAS is BULLISH, then TRADE_DIRECTION must be LONG and levels should satisfy:
-      STOP_LOSS_LEVEL < ENTRY_LEVEL < TAKE_PROFIT_1 < TAKE_PROFIT_2
-    - If BIAS is BEARISH, then TRADE_DIRECTION must be SHORT and levels should satisfy:
-      TAKE_PROFIT_2 < TAKE_PROFIT_1 < ENTRY_LEVEL < STOP_LOSS_LEVEL
-    - If BIAS is UNSURE, then TRADE_DIRECTION must be UNSURE and all level fields must be exactly:
-      UNSURE
+    - BULLISH → TRADE_DIRECTION = LONG: STOP_LOSS_LEVEL < ENTRY_LEVEL < TAKE_PROFIT_1 < TAKE_PROFIT_2
+    - BEARISH → TRADE_DIRECTION = SHORT: TAKE_PROFIT_2 < TAKE_PROFIT_1 < ENTRY_LEVEL < STOP_LOSS_LEVEL
+    - UNSURE → TRADE_DIRECTION = UNSURE: all level fields must be exactly UNSURE
     - Do not output placeholders like N/A, TBD, or null
     """.strip()
 
@@ -881,15 +914,15 @@ def single_stock_analysis(stock_query: str, client) -> str:
     if not analysis_payload:
         return response_text
 
-    cleaned_response_text = _remove_single_stock_summary_driver_lines(response_text)
-    summary_section = _build_single_stock_summary_section(
-        analysis_payload, search_payload=step1_payload
-    )
-    return f"{cleaned_response_text}\n\n{summary_section}".strip()
+    upside_downside_keys = {f"UPSIDE_{i}" for i in range(1, 6)} | {f"DOWNSIDE_{i}" for i in range(1, 6)}
+    main_payload = {k: v for k, v in analysis_payload.items() if k not in upside_downside_keys}
+    summary_table = _build_single_stock_summary_section(analysis_payload, step1_payload)
+
+    return json.dumps(main_payload, indent=2, ensure_ascii=False) + "\n\n" + summary_table
 
 
 def daily_market_analysis(
-    client, current_port: str | None = None, market="US, Swedish and polish", buying_power=None
+    client, current_port: str | None = None, market="US", buying_power=None
 ):
     logger.info("Running daily market analysis")
 
@@ -899,25 +932,37 @@ def daily_market_analysis(
         IMPORTANT — Current portfolio context:
         {current_port}
         """.strip()
-    print(market)
+    logger.info("Daily market analysis market scope: %s", market)
 
     prompt1 = f"""
-    You are a professional portfolio manager and short-term swing trader (3-6 months).
+    You are a professional swing trader and portfolio manager targeting 30–180 day trades.
 
     Task:
-    Scan current global equity markets using recent news and macro information.
-    Analyze:
-    - Market regime (risk-on / risk-off, rates, inflation, geopolitics)
-    - Sector rotation and relative strength
-    - Major catalysts (earnings trends, guidance, AI, energy, defense, healthcare, regulation)
-    - Liquidity and institutional relevance
+    Using Google Search and current market knowledge, scan global equity markets for the most
+    compelling swing trade setups available RIGHT NOW.
 
+    Evaluate:
+    - Market regime (risk-on / risk-off, rates, inflation, macro backdrop)
+    - Sector rotation leadership and institutional flow evidence
+    - Earnings momentum (consecutive beats, revenue acceleration, guidance raises)
+    - Theme catalysts (AI, defense, energy transition, healthcare innovation, regulation)
+
+    Setup criteria — candidates SHOULD show at least ONE of:
+    - Base breakout: stock consolidating tightly above support, near a breakout point
+    - Pullback entry: uptrending stock (above 50-day MA) pulling back to rising MA or prior breakout level
+    - Earnings momentum: 2+ consecutive beats with accelerating EPS/revenue, price not yet extended
+    - Sector rotation leader: sector entering bull rotation, stock leading the move with relative strength
+
+    Rejection criteria — EXCLUDE any stock with:
+    - Price in a confirmed downtrend (below 200-day MA with no clear basing pattern)
+    - Earnings within 7 calendar days (unless the entire thesis is the upcoming catalyst)
+    - Microcap or thin volume (prefer market cap >$500M, avg daily volume >500K shares)
+    - No identifiable catalyst — momentum without a reason deteriorates fast
 
     Universe:
     - {market} equities only
-    - Highly liquid stocks (no microcaps, no thin volume)
-    - Avoid stocks with earnings within the next 7 calendar days unless the catalyst is earnings-driven
-    - Make sure the tickers are supported by the yfinance python api
+    - Highly liquid stocks only
+    - Tickers must be supported by the yfinance Python API
 
     Objective:
     Identify up to 10 stock tickers that offer the BEST incremental risk-adjusted swing trade
@@ -930,11 +975,11 @@ def daily_market_analysis(
     - Base conclusions only on recent, verifiable information
 
     Output rules:
-    If NO stocks are interesting, output exactly:
+    If NO stocks qualify, output exactly:
     no opportunity
 
-    If stocks ARE interesting, output EXACTLY in this 2-line format with no extra text:
-    MARKET_CONTEXT: <one short paragraph, max 60 words>
+    If stocks qualify, output EXACTLY in this 2-line format with no extra text:
+    MARKET_CONTEXT: <one paragraph max 60 words: regime, sector rotation, and dominant setup theme>
     TICKERS: <comma-separated list of ticker symbols in uppercase>
     """.strip()
 
@@ -983,50 +1028,76 @@ def daily_market_analysis(
         )
 
     prompt2 = f"""
-    You are a professional portfolio manager and short-term swing trader (3-6 months).
+    You are a professional swing trader (30–180 day horizon) evaluating a shortlist of candidates.
+    Your job is to independently assess each ticker and output ONLY those that pass all quality filters.
+    Do NOT assume any of them are good trades — treat each one as innocent until proven viable.
 
     Market context from the prior scan:
     {market_context}
 
-    You will be given:
-    - A list of stock ticker symbols
-    - Access to the function get_current_ticker_data for live market data
-
-    Your goal:
-    Determine which ticker represents the SINGLE BEST risk-adjusted LONG opportunity right now (30-180 days), or output "no opportunity".
-
     STRICT TOOL RULES:
-    - You MUST call get_current_ticker_data at least once for EACH ticker in the list
+    - You MUST call get_current_ticker_data exactly once for EACH ticker
+    - After determining trade levels for a viable ticker, call compute_ex_ante_sharpe(entry, stop_loss, tp1, tp2, atr_14)
     - If you cannot retrieve valid data for a ticker, discard it
-    - Do NOT invent prices or levels
-    - Use the retrieved current price and date in your final output
-    
+    - Do NOT invent prices or levels — all numbers must come from tool output
 
-    Analysis requirements:
-    - Validate catalyst plausibility from market context
-    - Sanity-check fundamentals at a high level
-    - Confirm market or sector regime alignment
-    - Use trend, structure, and volatility logic for levels
-    - Prefer liquid, institutionally relevant setups
+    KEY DATA TO EXTRACT from each tool result:
+    - price_history: last_close, atr_14, atr_14_pct, avg_volume_20d, last_volume, volume_ratio_vs_20d,
+                     range_20d_high, range_20d_low, close_vs_20d_high_pct, recent_bars_10d
+    - relative_strength: signal, composite_score, rrg_quadrant, mrs_52w, rolling_alpha_annualized_pct
+    - market_correlation: interpretation, beta_6_12m
+    - fundamentals: sector, beta, forward_pe, revenue_growth_pct, earnings_growth_pct
 
-    Risk rules:
-    - Provide a clear entry close to current price or a well-defined breakout or pullback trigger
-    - stop_loss must be a real invalidation level, not arbitrary
-    - take_profit_1 and take_profit_2 must be realistic from ATR or structure and give favorable reward to risk
-    - Only LONG ideas unless explicitly asked for shorts
+    BIAS DETERMINATION — apply to each ticker independently:
+      BULLISH signals: price near range_20d_high, rrg_quadrant "leading"/"improving",
+                       composite_score > 0, positive recent catalysts, strong earnings momentum
+      BEARISH / DISCARD signals: price near range_20d_low, rrg_quadrant "lagging"/"weakening",
+                                  composite_score < −0.2, deteriorating fundamentals, negative catalysts
+      If signals conflict materially or data is insufficient → discard the ticker (do NOT force a bullish view)
 
-    Sharpe ranking:
-    - After determining trade levels for each viable ticker, call compute_ex_ante_sharpe(entry, stop_loss,
-      tp1, tp2, atr_14) to get the ex-ante Sharpe ratio for that setup
-    - Use the Sharpe ratio as the primary ranking signal when confidence levels are equal or close:
-      prefer higher Sharpe setups as they offer better risk-adjusted return
-    - Discard setups with a negative Sharpe ratio unless no alternatives exist
+    LEVEL-SETTING METHODOLOGY (apply only to tickers that show BULLISH bias):
+
+    Entry:
+      - Pullback setup: buy at or just above a recent support level (prior breakout base, rising 20/50MA zone)
+      - Breakout setup: buy at consolidation high + (0.1 × atr_14) as a buffer above resistance
+      - Entry must be within 2% of current price or at a clearly defined trigger level with a price alert
+
+    Stop-loss:
+      - Place below the most recent 10-day swing low OR 2.0 × atr_14 below entry — use whichever is TIGHTER
+      - Absolute limits: minimum 0.5 × atr_14 below entry, maximum 2.5 × atr_14 below entry
+      - The level must represent real technical invalidation (below support or a swing-low structure)
+      - Do NOT use arbitrary round-number stops
+
+    Take-profit:
+      - TP1: the nearer of (prior resistance / 52-week high area) OR (2.0 × risk distance above entry)
+      - TP2: measured move (height of the base added to the breakout level) OR (3.0 × risk distance above entry)
+      - MANDATORY: (TP1 − entry) / (entry − stop_loss) ≥ 2.0
+      - If you cannot achieve 2:1 R:R on TP1, this setup is NOT viable — discard it
+
+    QUALITY FILTERS — discard the ticker if ANY of these apply:
+      - Bias is not clearly BULLISH (mixed or bearish signals → discard)
+      - R:R to TP1 < 2.0 (as above)
+      - Sharpe ratio from compute_ex_ante_sharpe < 0.4
+      - rrg_quadrant is "lagging" AND there is no overriding near-term catalyst
+      - composite_score < −0.2 (sustained relative underperformance vs index)
+      - volume_ratio_vs_20d < 0.5 on a supposed breakout day (no volume conviction)
+      - beta_6_12m > 3.0 (too noisy for a defined-risk swing trade)
+      - earnings within 7 days (check earnings_event section if present)
+
+    PREFERENCE RANKING (when multiple setups pass all filters):
+      1. Higher ex-ante Sharpe ratio
+      2. RRG quadrant: leading > improving > weakening
+      3. composite_score (higher = stronger relative strength)
+      4. Catalyst quality and sector regime alignment with market_context above
+
+    {buying_power_line}
 
     Output rules:
-    - If NO high-quality opportunity exists after checking all tickers, output exactly:
-    no opportunity
-    - For an opportunity to be vaible it should have a confidence of 8 or higher.
-    - If there are multiple Stocks sharing the highest confidence level output them all after each other
+    - For an opportunity to be viable it must have a Confidence of 8 or higher
+    - Be honest with Confidence: 8 means high conviction with strong bullish bias AND clean setup.
+      Do NOT inflate Confidence just to cross the 8 threshold. If genuinely uncertain, discard.
+    - If NO ticker passes the quality filters with Confidence ≥ 8, output exactly: no opportunity
+    - If multiple tickers share the highest Confidence level, output all of them, one object per line
     - If there IS an opportunity, output the object(s) with NO extra keys, NO comments, NO markdown:
     {{
     "ticker": "STRING",
@@ -1037,14 +1108,15 @@ def daily_market_analysis(
     "take_profit_1": NUMBER,
     "take_profit_2": NUMBER,
     "buy_in_quantity": INTEGER,
-    "Confidence": INTEGER (num from 0-10),
-    "atr_14": NUMBER (the 14-period ATR value as returned by get_current_ticker_data for this ticker),
-    "sharpe_ratio": NUMBER (the ex-ante Sharpe ratio as returned by compute_ex_ante_sharpe for this ticker)
+    "Confidence": INTEGER (0-10),
+    "atr_14": NUMBER (from get_current_ticker_data),
+    "sharpe_ratio": NUMBER (from compute_ex_ante_sharpe)
     }}
 
-    Constraints:
+    Hard constraints:
     - stop_loss < buy_in_price < take_profit_1 < take_profit_2
-    - If there is no opportunity the output must be only the object or the text "no opportunity"
+    - (take_profit_1 - buy_in_price) / (buy_in_price - stop_loss) >= 2.0
+    - Output must be ONLY the JSON object(s) or the text "no opportunity" — nothing else
 
     Tickers to analyze:
     {", ".join(tickers)}

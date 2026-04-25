@@ -64,18 +64,16 @@ def format_ticker_data_for_ai(
     analyst: Dict[str, Any],
     price_targets: Optional[Dict[str, Any]] = None,
     price_history: Optional[Dict[str, Any]] = None,
+    ma_summary: Optional[Dict[str, Any]] = None,
     nav_discount: Optional[Dict[str, Any]] = None,
     market_correlation: Optional[Dict[str, Any]] = None,
     relative_strength: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """
-    Combine filtered ticker data into a single, AI-friendly string.
-    Skips fields with None values and empty sections.
-    """
     sections = [
         ("fundamentals", info_filtered),
         ("price_context", fast_filtered),
         ("price_history", price_history or {}),
+        ("moving_averages", ma_summary or {}),
         ("nav_discount", nav_discount or {}),
         ("market_correlation", market_correlation or {}),
         ("relative_strength", relative_strength or {}),
@@ -118,35 +116,20 @@ class YFInfoFundamentals:
     beta: Optional[float]
     average_volume: Optional[float]
 
-    # Valuation
+    # Valuation (PE ratios give directional context without EPS noise)
     trailing_pe: Optional[float]
     forward_pe: Optional[float]
-    price_to_book: Optional[float]
 
-    # Profitability & growth (percent)
+    # Profitability & growth (percent) — profit_margins is the single swing-relevant margin signal
     profit_margins_pct: Optional[float]
-    operating_margins_pct: Optional[float]
-    gross_margins_pct: Optional[float]
     revenue_growth_pct: Optional[float]
     earnings_growth_pct: Optional[float]
 
-    # 52w context
-    fifty_two_week_high: Optional[float]
-    fifty_two_week_low: Optional[float]
-
-    # EPS / dividends
-    trailing_eps: Optional[float]
-    forward_eps: Optional[float]
-    dividend_yield_pct: Optional[float]
-
-    # Balance-sheet risk (if present)
+    # Balance-sheet risk
     debt_to_equity: Optional[float]
 
     @staticmethod
     def from_yfinance_info(info: Dict[str, Any]) -> "YFInfoFundamentals":
-        """
-        Takes yfinance Ticker.info dict and returns a filtered, structured snapshot.
-        """
         return YFInfoFundamentals(
             sector=_safe_str(_get(info, "sector")),
             industry=_safe_str(_get(info, "industry")),
@@ -156,17 +139,9 @@ class YFInfoFundamentals:
             average_volume=_to_float(_get(info, "averageVolume")),
             trailing_pe=_to_float(_get(info, "trailingPE")),
             forward_pe=_to_float(_get(info, "forwardPE")),
-            price_to_book=_to_float(_get(info, "priceToBook")),
             profit_margins_pct=_pct_to_float(_get(info, "profitMargins")),
-            operating_margins_pct=_pct_to_float(_get(info, "operatingMargins")),
-            gross_margins_pct=_pct_to_float(_get(info, "grossMargins")),
             revenue_growth_pct=_pct_to_float(_get(info, "revenueGrowth")),
             earnings_growth_pct=_pct_to_float(_get(info, "earningsGrowth")),
-            fifty_two_week_high=_to_float(_get(info, "fiftyTwoWeekHigh")),
-            fifty_two_week_low=_to_float(_get(info, "fiftyTwoWeekLow")),
-            trailing_eps=_to_float(_get(info, "trailingEps")),
-            forward_eps=_to_float(_get(info, "forwardEps")),
-            dividend_yield_pct=_pct_to_float(_get(info, "dividendYield")),
             debt_to_equity=_to_float(_get(info, "debtToEquity")),
         )
 
@@ -185,18 +160,12 @@ class YFFastInfoSnapshot:
     previous_close: Optional[float]
     day_high: Optional[float]
     day_low: Optional[float]
-    year_high: Optional[float]
-    year_low: Optional[float]
-    market_cap: Optional[float]
-    shares_outstanding: Optional[float]
-    currency: Optional[str]
+    year_high: Optional[float]   # 52-week high (authoritative price anchor)
+    year_low: Optional[float]    # 52-week low (authoritative price anchor)
+    currency: Optional[str]      # retained here because futures skip fundamentals
 
     @staticmethod
     def from_yfinance_fast_info(fast_info: Dict[str, Any]) -> "YFFastInfoSnapshot":
-        """
-        Takes yfinance Ticker.fast_info dict-like and returns filtered snapshot.
-        """
-        # fast_info keys are snake_case
         return YFFastInfoSnapshot(
             last_price=_to_float(_get(fast_info, "last_price")),
             previous_close=_to_float(_get(fast_info, "previous_close")),
@@ -204,8 +173,6 @@ class YFFastInfoSnapshot:
             day_low=_to_float(_get(fast_info, "day_low")),
             year_high=_to_float(_get(fast_info, "year_high")),
             year_low=_to_float(_get(fast_info, "year_low")),
-            market_cap=_to_float(_get(fast_info, "market_cap")),
-            shares_outstanding=_to_float(_get(fast_info, "shares_outstanding")),
             currency=_safe_str(_get(fast_info, "currency")),
         )
 
@@ -229,7 +196,7 @@ class YFPriceHistorySummary:
     range_20d_high: Optional[float]
     range_20d_low: Optional[float]
     close_vs_20d_high_pct: Optional[float]
-    recent_bars_5d: Optional[str]
+    recent_bars_10d: Optional[str]   # 10 bars ≈ 2 trading weeks of OHLCV context
 
     @staticmethod
     def from_history(
@@ -238,7 +205,7 @@ class YFPriceHistorySummary:
         atr_period: int = 14,
         volume_window: int = 20,
         range_window: int = 20,
-        recent_bars: int = 5,
+        recent_bars: int = 10,
     ) -> "YFPriceHistorySummary":
         if not isinstance(history, pd.DataFrame) or history.empty:
             return YFPriceHistorySummary(
@@ -379,7 +346,110 @@ class YFPriceHistorySummary:
             range_20d_high=range_high,
             range_20d_low=range_low,
             close_vs_20d_high_pct=close_vs_high_pct,
-            recent_bars_5d=recent_bars_str,
+            recent_bars_10d=recent_bars_str,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# -----------------------------
+# 3b) moving average proximity (trend structure — most important swing context)
+# -----------------------------
+
+
+@dataclass(frozen=True)
+class YFMovingAverageSummary:
+    """
+    Key MAs and price proximity as percentages.
+    All values computed from 1-year daily history when available (3-month as fallback for SMA20/50).
+
+    Positive pct = price is ABOVE the MA.
+    Negative pct = price is BELOW the MA.
+
+    trend_structure uses a 4-state label the AI can apply directly:
+      "price_above_50_above_200" — bullish structure (both MAs support price)
+      "price_above_50_below_200" — recovery / early reversal (price leads MAs)
+      "price_below_50_above_200" — pullback within uptrend (MA50 acts as resistance)
+      "price_below_50_below_200" — bearish structure (both MAs are overhead)
+    """
+
+    sma_20: Optional[float]
+    sma_50: Optional[float]
+    sma_200: Optional[float]
+    close_vs_sma20_pct: Optional[float]   # % distance from SMA20
+    close_vs_sma50_pct: Optional[float]   # % distance from SMA50
+    close_vs_sma200_pct: Optional[float]  # % distance from SMA200
+    trend_structure: Optional[str]
+
+    @staticmethod
+    def from_history(
+        history: Optional[pd.DataFrame],
+    ) -> "YFMovingAverageSummary":
+        _empty = YFMovingAverageSummary(
+            None, None, None, None, None, None, None
+        )
+        if not isinstance(history, pd.DataFrame) or history.empty:
+            return _empty
+
+        df = history.copy()
+
+        def _col(name: str) -> Optional[str]:
+            if name in df.columns:
+                return name
+            lower_map = {c.lower(): c for c in df.columns}
+            return lower_map.get(name.lower())
+
+        close_col = _col("Close") or _col("Adj Close")
+        if close_col is None:
+            return _empty
+
+        close = pd.to_numeric(df[close_col], errors="coerce").dropna()
+        if close.empty:
+            return _empty
+
+        last_close = close.iloc[-1]
+
+        def _sma(window: int) -> Optional[float]:
+            if len(close) < window:
+                return None
+            val = close.tail(window).mean()
+            return _round_opt(val, 2) if pd.notna(val) else None
+
+        def _dist_pct(sma: Optional[float]) -> Optional[float]:
+            if sma is None or sma == 0:
+                return None
+            return _round_opt((last_close / sma - 1.0) * 100.0, 2)
+
+        sma_20 = _sma(20)
+        sma_50 = _sma(50)
+        sma_200 = _sma(200)
+
+        above_50 = (sma_50 is not None) and (last_close >= sma_50)
+        above_200 = (sma_200 is not None) and (last_close >= sma_200)
+
+        if sma_50 is not None and sma_200 is not None:
+            if above_50 and above_200:
+                trend_structure = "price_above_50_above_200"
+            elif above_50 and not above_200:
+                trend_structure = "price_above_50_below_200"
+            elif not above_50 and above_200:
+                trend_structure = "price_below_50_above_200"
+            else:
+                trend_structure = "price_below_50_below_200"
+        elif sma_50 is not None:
+            trend_structure = "price_above_50" if above_50 else "price_below_50"
+        else:
+            trend_structure = None
+
+        return YFMovingAverageSummary(
+            sma_20=sma_20,
+            sma_50=sma_50,
+            sma_200=sma_200,
+            close_vs_sma20_pct=_dist_pct(sma_20),
+            close_vs_sma50_pct=_dist_pct(sma_50),
+            close_vs_sma200_pct=_dist_pct(sma_200),
+            trend_structure=trend_structure,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -396,8 +466,6 @@ class YFNavDiscountPremium:
     nav_price: Optional[float]
     market_price: Optional[float]
     nav_discount_premium_pct: Optional[float]  # negative = discount, positive = premium
-    nav_source: Optional[str]
-    price_source: Optional[str]
 
     @staticmethod
     def from_yfinance_info(
@@ -407,13 +475,13 @@ class YFNavDiscountPremium:
         def _pick(
             d: Dict[str, Any],
             keys: List[str],
-        ) -> tuple[Optional[float], Optional[str]]:
+        ) -> Optional[float]:
             for key in keys:
                 if key in d:
                     val = _to_float(d.get(key))
                     if val is not None:
-                        return val, key
-            return None, None
+                        return val
+            return None
 
         info = info or {}
         fast_info = fast_info or {}
@@ -435,10 +503,10 @@ class YFNavDiscountPremium:
             "previous_close",
         ]
 
-        nav_price, nav_source = _pick(info, nav_keys)
-        market_price, price_source = _pick(fast_info, price_keys_fast)
+        nav_price = _pick(info, nav_keys)
+        market_price = _pick(fast_info, price_keys_fast)
         if market_price is None:
-            market_price, price_source = _pick(info, price_keys_info)
+            market_price = _pick(info, price_keys_info)
 
         nav_discount_premium_pct = None
         if nav_price is not None and market_price is not None and nav_price != 0:
@@ -450,8 +518,6 @@ class YFNavDiscountPremium:
             nav_price=nav_price,
             market_price=market_price,
             nav_discount_premium_pct=nav_discount_premium_pct,
-            nav_source=nav_source,
-            price_source=price_source,
         )
 
     def to_dict(self) -> Dict[str, Any]:

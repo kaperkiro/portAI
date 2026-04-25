@@ -155,12 +155,10 @@ def buyStock(Ticker, qty, trading_client):
 
 
 def sellStock(Ticker, qty, trading_client):
-    # Tested working!
     logger.info("Submitting sell order: ticker=%s qty=%s", Ticker, qty)
     sellOrder = MarketOrderRequest(
         symbol=Ticker,
         qty=qty,
-        limit_price=500,
         side=OrderSide.SELL,
         time_in_force=TimeInForce.DAY,
     )

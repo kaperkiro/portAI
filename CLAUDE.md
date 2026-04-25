@@ -1,5 +1,17 @@
 # CLAUDE.md
 
+# AI Coding Assistant Guidelines
+
+You are interacting with a codebase that uses an external Markdown memory system. 
+
+Before starting any task or writing code, you MUST:
+1. Read `claude_memory/01_active_context.md` to understand the current objective.
+2. Read `claude_memory/02_architecture.md` for tech stack rules and constraints.
+
+When you finish a task, I will ask you to "update memory." When I do this, you must:
+1. Update `claude_memory/01_active_context.md` with the next steps.
+2. Append a brief summary of our changes to `claude_memory/03_changelog.md`.
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
