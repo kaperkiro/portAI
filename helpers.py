@@ -1415,3 +1415,186 @@ def compute_ex_ante_sharpe(
         return round((expected_return_pct - rf_period) / period_vol, 3)
     except Exception:
         return None
+
+
+# ===========================
+# v2 additions
+# ===========================
+
+
+@dataclass(frozen=True)
+class YFWeeklyStructure:
+    """
+    5-year weekly bar summary for identifying major support/resistance zones
+    and long-term trend structure.  Used by v2 analysis (1-12 month horizon).
+
+    sma_20w ≈ 100-day MA; sma_40w ≈ 200-day MA on the weekly chart.
+    high/low_52w = trailing-52-week range; high/low_104w = 2-year range.
+    weekly_trend_structure mirrors the 4-state label from YFMovingAverageSummary.
+    recent_bars_8w provides 8 weekly OHLCV candles (≈ 2 months of weekly context).
+    """
+
+    sma_20w: Optional[float]
+    sma_40w: Optional[float]
+    close_vs_sma20w_pct: Optional[float]
+    close_vs_sma40w_pct: Optional[float]
+    high_52w: Optional[float]
+    low_52w: Optional[float]
+    high_104w: Optional[float]
+    low_104w: Optional[float]
+    weekly_trend_structure: Optional[str]
+    recent_bars_8w: Optional[str]
+
+    @staticmethod
+    def from_weekly_history(
+        history: Optional[pd.DataFrame],
+    ) -> "YFWeeklyStructure":
+        _empty = YFWeeklyStructure(
+            None, None, None, None, None, None, None, None, None, None
+        )
+        if not isinstance(history, pd.DataFrame) or history.empty:
+            return _empty
+
+        df = history.copy()
+
+        def _col(name: str) -> Optional[str]:
+            if name in df.columns:
+                return name
+            lower_map = {c.lower(): c for c in df.columns}
+            return lower_map.get(name.lower())
+
+        close_col = _col("Close") or _col("Adj Close")
+        high_col = _col("High")
+        low_col = _col("Low")
+
+        if close_col is None:
+            return _empty
+
+        close = pd.to_numeric(df[close_col], errors="coerce").dropna()
+        if close.empty:
+            return _empty
+
+        last_close = close.iloc[-1]
+
+        def _sma_w(window: int) -> Optional[float]:
+            if len(close) < window:
+                return None
+            val = close.tail(window).mean()
+            return _round_opt(val, 2) if pd.notna(val) else None
+
+        def _dist_pct(sma: Optional[float]) -> Optional[float]:
+            if sma is None or sma == 0:
+                return None
+            return _round_opt((last_close / sma - 1.0) * 100.0, 2)
+
+        sma_20w = _sma_w(20)
+        sma_40w = _sma_w(40)
+
+        above_20w = sma_20w is not None and last_close >= sma_20w
+        above_40w = sma_40w is not None and last_close >= sma_40w
+
+        if sma_20w is not None and sma_40w is not None:
+            if above_20w and above_40w:
+                weekly_trend = "price_above_20w_above_40w"
+            elif above_20w:
+                weekly_trend = "price_above_20w_below_40w"
+            elif above_40w:
+                weekly_trend = "price_below_20w_above_40w"
+            else:
+                weekly_trend = "price_below_20w_below_40w"
+        elif sma_40w is not None:
+            weekly_trend = "price_above_40w" if above_40w else "price_below_40w"
+        else:
+            weekly_trend = None
+
+        high52 = low52 = high104 = low104 = None
+        if high_col is not None and low_col is not None:
+            try:
+                high_s = pd.to_numeric(df[high_col], errors="coerce")
+                low_s = pd.to_numeric(df[low_col], errors="coerce")
+                high52 = _round_opt(high_s.tail(52).max(), 2)
+                low52 = _round_opt(low_s.tail(52).min(), 2)
+                high104 = _round_opt(high_s.tail(104).max(), 2)
+                low104 = _round_opt(low_s.tail(104).min(), 2)
+            except Exception:
+                pass
+
+        recent_bars_str = None
+        try:
+            tail = df.tail(8)
+            vol_col = _col("Volume")
+            parts = []
+            for idx, row in tail.iterrows():
+                try:
+                    dt = pd.to_datetime(idx).date().isoformat()
+                except Exception:
+                    dt = str(idx)
+                c_val = _to_float(row.get(close_col))
+                h_val = _to_float(row.get(high_col)) if high_col else None
+                l_val = _to_float(row.get(low_col)) if low_col else None
+                v_val = _to_int(row.get(vol_col)) if vol_col else None
+                if c_val is None:
+                    continue
+                parts_inner = [dt, f"C={c_val:.2f}"]
+                if h_val is not None and l_val is not None:
+                    parts_inner.append(f"H={h_val:.2f} L={l_val:.2f}")
+                if v_val is not None:
+                    parts_inner.append(f"V={v_val}")
+                parts.append(" ".join(parts_inner))
+            recent_bars_str = "; ".join(parts) if parts else None
+        except Exception:
+            recent_bars_str = None
+
+        return YFWeeklyStructure(
+            sma_20w=sma_20w,
+            sma_40w=sma_40w,
+            close_vs_sma20w_pct=_dist_pct(sma_20w),
+            close_vs_sma40w_pct=_dist_pct(sma_40w),
+            high_52w=high52,
+            low_52w=low52,
+            high_104w=high104,
+            low_104w=low104,
+            weekly_trend_structure=weekly_trend,
+            recent_bars_8w=recent_bars_str,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class YFEnhancedFundamentals:
+    """
+    Additional quality-oriented fundamentals used by v2 analysis.
+    These fields matter most for holding periods > 3 months, where
+    business quality and cash-generation ability drive sustained moves.
+    """
+
+    free_cashflow: Optional[float]
+    operating_cashflow: Optional[float]
+    gross_margins_pct: Optional[float]
+    operating_margins_pct: Optional[float]
+    return_on_equity: Optional[float]
+    return_on_assets: Optional[float]
+    current_ratio: Optional[float]
+    dividend_yield_pct: Optional[float]
+    peg_ratio: Optional[float]
+    price_to_book: Optional[float]
+
+    @staticmethod
+    def from_yfinance_info(info: Dict[str, Any]) -> "YFEnhancedFundamentals":
+        return YFEnhancedFundamentals(
+            free_cashflow=_to_float(_get(info, "freeCashflow")),
+            operating_cashflow=_to_float(_get(info, "operatingCashflow")),
+            gross_margins_pct=_pct_to_float(_get(info, "grossMargins")),
+            operating_margins_pct=_pct_to_float(_get(info, "operatingMargins")),
+            return_on_equity=_pct_to_float(_get(info, "returnOnEquity")),
+            return_on_assets=_pct_to_float(_get(info, "returnOnAssets")),
+            current_ratio=_to_float(_get(info, "currentRatio")),
+            dividend_yield_pct=_pct_to_float(_get(info, "dividendYield")),
+            peg_ratio=_to_float(_get(info, "pegRatio")),
+            price_to_book=_to_float(_get(info, "priceToBook")),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)

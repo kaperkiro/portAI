@@ -1,0 +1,220 @@
+ANALYSIS COMMANDS — HOW THEY WORK AND HOW THEY DIFFER
+=======================================================
+
+COMMANDS
+--------
+  python main.py analyze-stock <query>    # e.g. analyze-stock AMD
+  python main.py analyze-asset <query>    # e.g. analyze-asset gold
+  python main.py analyze-stock-v2 <query> # enhanced 1–12 month version
+  python main.py <query>                  # shorthand, same as analyze-stock
+
+NOTE: "analyze-stock" and "analyze-asset" are aliases for the exact same
+function (single_stock_analysis). The difference in behaviour comes entirely
+from what kind of instrument the query resolves to — a stock/ETF or a
+commodity future — and the system handles each path differently automatically.
+
+
+HOW THE QUERY IS RESOLVED
+--------------------------
+Step 1 — built-in alias table (assets only)
+  Before hitting Gemini, the system checks KNOWN_SINGLE_INSTRUMENT_ALIASES
+  in AI_calls.py. This table maps ~40 commodity/asset names to hard-coded
+  Yahoo Finance futures tickers and provides curated context:
+
+    "gold"        → GC=F (Gold Futures)
+    "silver"      → SI=F (Silver Futures)
+    "brent"       → BZ=F (Brent Crude)
+    "crude oil"   → CL=F (WTI Crude)
+    "natural gas" → NG=F (Henry Hub Natural Gas)
+    "copper"      → HG=F (Copper Futures)
+
+  Each alias entry includes a pre-written SEARCH_SUMMARY, RECENT_CATALYSTS,
+  and KEY_RISKS used directly in the analysis — no live web search needed.
+
+Step 1 — Google Search fallback (stocks and unknown assets)
+  If the query doesn't match any alias, Gemini runs a Google Search to
+  identify the best Yahoo Finance-compatible ticker and returns:
+    TICKER, COMPANY, INSTRUMENT_TYPE, MATCH_CONFIDENCE,
+    SEARCH_SUMMARY, RECENT_CATALYSTS, KEY_RISKS
+
+  This step handles stocks, ETFs, indices, less common commodities, and
+  anything the user types in plain language ("nvidia", "s&p 500 etf", etc.).
+
+
+DATA FETCHED — STOCKS vs ASSETS
+---------------------------------
+After the ticker is resolved, the system calls get_current_ticker_data().
+The data path forks based on whether the ticker ends in "=F" (futures contract).
+
+  STOCKS / ETFs (e.g. AMD, SPY, AAPL)
+  ─────────────────────────────────────
+  All of the following are fetched from yfinance and passed to Gemini:
+
+  [fundamentals]
+    sector, industry, market_cap, beta, average_volume,
+    trailing_pe, forward_pe, profit_margins_pct,
+    revenue_growth_pct, earnings_growth_pct, debt_to_equity
+
+  [price_context]
+    last_price, previous_close, day_high, day_low,
+    year_high, year_low, currency, market_cap, shares_outstanding
+
+  [price_history]  — 3 months of daily bars
+    last_close, atr_14, atr_14_pct,
+    avg_volume_20d, last_volume, volume_ratio_vs_20d,
+    range_20d_high, range_20d_low, close_vs_20d_high_pct,
+    recent_bars_10d (last 10 daily OHLCV candles)
+
+  [moving_averages]  — computed from 1 year of daily history
+    sma_20, sma_50, sma_200,
+    close_vs_sma20_pct, close_vs_sma50_pct, close_vs_sma200_pct,
+    trend_structure (e.g. "price_above_50_above_200")
+
+  [market_correlation]  — vs the stock's exchange index (e.g. GSPC, IXIC, GDAXI)
+    index, correlation_6_12m, beta_6_12m, interpretation
+
+  [relative_strength]  — vs the same benchmark index
+    mrs_4w, mrs_13w, mrs_52w (Mansfield Relative Strength)
+    rolling_beta_63d, rolling_alpha_annualized_pct
+    rrg_rs_ratio, rrg_rs_momentum, rrg_quadrant
+    composite_score (-1 to +1), signal
+
+  [earnings_event]
+    earnings_date_iso, earnings_in_days
+
+  [analyst_signal]
+    latest_firm, latest_action_iso, trend_90d, rating_buckets
+
+  [analyst_price_targets]
+    mean, low, high, median targets from Wall Street analysts
+
+  [nav_discount]  — only meaningful for ETFs or closed-end funds
+    nav_price, market_price, nav_discount_premium_pct
+
+
+  COMMODITY FUTURES (e.g. GC=F, BZ=F, NG=F)
+  ────────────────────────────────────────────
+  Futures tickers (ending in "=F") take a price-history-only path.
+  The following are NOT fetched:
+
+    ✗ fundamentals (no PE, no earnings, no sector, no market cap)
+    ✗ market_correlation (no exchange → no benchmark index)
+    ✗ relative_strength (no benchmark → no MRS, RRG, alpha)
+    ✗ earnings_event (commodities have no earnings calendar)
+    ✗ analyst_signal (no analyst recommendations)
+    ✗ analyst_price_targets (no price targets)
+    ✗ nav_discount (not applicable)
+
+  Only these sections are populated:
+
+  [price_context]
+    last_price, previous_close, day_high, day_low, year_high, year_low, currency
+
+  [price_history]  — same 3-month window as equities
+    last_close, atr_14, atr_14_pct,
+    avg_volume_20d, last_volume, volume_ratio_vs_20d,
+    range_20d_high, range_20d_low, close_vs_20d_high_pct,
+    recent_bars_10d
+
+  [moving_averages]  — same computation as equities
+    sma_20, sma_50, sma_200, trend_structure, close_vs_sma*_pct
+
+
+BASIS OF THE AI DECISION
+--------------------------
+In both cases Gemini uses extended thinking ("thinking_level=high") and runs
+a two-step analysis. The decision framework is identical, but the available
+evidence differs significantly.
+
+  STOCKS
+  ──────
+  The AI weighs multiple data dimensions:
+
+  1. Macro/news context     — from the Google Search step (recent catalysts,
+                              key risks, search summary)
+  2. Technical setup        — ATR-based levels, 20d range position, MA alignment,
+                              trend_structure (50/200 MA relationship)
+  3. Relative strength      — composite_score, rrg_quadrant, rolling_alpha
+                              (is this stock beating its market/sector?)
+  4. Market correlation     — beta and correlation to the exchange index
+                              (how much market risk does this carry?)
+  5. Fundamental quality    — PE ratios, revenue/earnings growth, profit margins,
+                              debt levels (is this a good business?)
+  6. Earnings risk          — earnings_in_days (avoids setups < 7 days from earnings)
+  7. Analyst momentum       — trend_90d, analyst price targets (soft signal)
+
+  The AI determines BIAS (BULLISH / BEARISH / UNSURE) then sets entry, stop,
+  and two take-profit levels using ATR multiples and swing-high/low structures.
+  It also calls compute_ex_ante_sharpe() to score the trade's risk-adjusted
+  expected return.
+
+  COMMODITY ASSETS
+  ─────────────────
+  Without fundamentals, earnings, correlation, or relative strength data,
+  the AI must work entirely from:
+
+  1. Curated context        — the pre-written SEARCH_SUMMARY, RECENT_CATALYSTS,
+                              and KEY_RISKS from KNOWN_SINGLE_INSTRUMENT_ALIASES
+                              (covers macro drivers: real yields, OPEC policy,
+                              weather, industrial demand, geopolitical risk, etc.)
+  2. Technical setup        — same ATR-based level methodology as stocks:
+                              atr_14, range position, MA alignment, trend_structure
+  3. Price momentum         — recent_bars_10d, volume_ratio, close_vs_20d_high_pct
+
+  The level-setting methodology is explicitly the same as for equities
+  (ATR multiples, swing-low stops, 2:1 R:R requirement). The prompt notes:
+  "For non-equity instruments: apply the same ATR-based methodology; do not
+  force earnings-style reasoning where it does not apply."
+
+  The Sharpe computation also runs the same way, using atr_14 as the
+  volatility input regardless of instrument type.
+
+
+SUMMARY TABLE
+--------------
+  Feature                    analyze-stock    analyze-asset (future)
+  ─────────────────────────────────────────────────────────────────
+  Ticker resolution          Google Search    Built-in alias table (preferred)
+                             or alias         → Google Search as fallback
+  Fundamentals               Yes              No
+  Earnings date / risk       Yes              No
+  Analyst ratings/targets    Yes              No
+  Relative strength vs index Yes              No
+  Market correlation / beta  Yes              No
+  Price history + ATR        Yes              Yes
+  Moving averages            Yes              Yes
+  Curated macro context      From search      Pre-written in alias table
+  Sharpe ratio calculation   Yes              Yes
+  ATR-based level setting    Yes              Yes
+
+
+ANALYZE-STOCK-V2
+-----------------
+analyze-stock-v2 is a different command that calls single_stock_analysis_v2(),
+which uses a richer data fetch (get_current_ticker_data_v2) and a more
+detailed analytical framework. Key additions vs v1:
+
+  Data additions:
+    - 5 years of weekly bars: sma_20w (≈100d MA), sma_40w (≈200d MA),
+      weekly_trend_structure, 52-week and 2-year high/low ranges,
+      recent_bars_8w (8 weekly OHLCV candles)
+    - Enhanced fundamentals (equities only): free_cashflow, operating_cashflow,
+      gross_margins_pct, operating_margins_pct, return_on_equity,
+      return_on_assets, current_ratio, dividend_yield_pct, peg_ratio,
+      price_to_book
+
+  Framework additions:
+    - Multi-timeframe bias: SHORT (1-3m daily), MEDIUM (3-6m daily),
+      LONG (6-12m weekly chart is primary)
+    - Fundamental quality grade: STRONG / ADEQUATE / WEAK / UNKNOWN
+      (adjusts CONFIDENCE score up or down)
+    - Setup quality grade: A / B / C / D
+    - Setup type classification: breakout, pullback_to_support, base,
+      momentum_continuation, reversal, unsure
+    - Two entry variants: ENTRY_AGGRESSIVE and ENTRY_CONSERVATIVE
+    - THESIS, KEY_CATALYST, INVALIDATION_TRIGGER fields
+    - HOLDING_PERIOD_ESTIMATE: 1-3m, 3-6m, or 6-12m
+    - Larger TP2 multipliers scaled to the holding period
+
+  v2 is slower (fetches more data) and suited for longer conviction trades.
+  v1 (analyze-stock / analyze-asset) is the default for quick swing setups.

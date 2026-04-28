@@ -1136,3 +1136,756 @@ def daily_market_analysis(
 
     logger.info("Daily market analysis step 2 completed")
     return (resp2.text or "").strip()
+
+
+# ===========================================================================
+# v2 additions — 1-12 month swing analysis
+# ===========================================================================
+
+
+def get_current_ticker_data_v2(ticker: str) -> str:
+    """
+    Enhanced version of get_current_ticker_data for 1-12 month swing analysis.
+    Returns all v1 data PLUS two additional sections:
+
+    [weekly_structure]
+      sma_20w (≈100-day), sma_40w (≈200-day), close_vs_sma20w/40w_pct,
+      high/low_52w, high/low_104w (2-year range), weekly_trend_structure,
+      recent_bars_8w (last 8 weekly OHLCV candles).
+
+    [enhanced_fundamentals]  (equity/ETF only — skipped for futures)
+      free_cashflow, operating_cashflow, gross_margins_pct,
+      operating_margins_pct, return_on_equity, return_on_assets,
+      current_ratio, dividend_yield_pct, peg_ratio, price_to_book.
+    """
+    base = get_current_ticker_data(ticker)
+
+    normalized_ticker = str(ticker).strip().upper()
+    price_history_only = _uses_price_history_only_market_data(normalized_ticker)
+    data = yf.Ticker(normalized_ticker)
+
+    extra: list[str] = []
+
+    try:
+        weekly_hist = data.history(period="5y", interval="1wk")
+        ws = hp.YFWeeklyStructure.from_weekly_history(weekly_hist).to_dict()
+        lines = [f"- {k}: {v}" for k, v in ws.items() if v is not None]
+        if lines:
+            extra += ["[weekly_structure]"] + lines
+    except Exception:
+        pass
+
+    if not price_history_only:
+        try:
+            info = data.info or {}
+            ef = hp.YFEnhancedFundamentals.from_yfinance_info(info).to_dict()
+            lines = [f"- {k}: {v}" for k, v in ef.items() if v is not None]
+            if lines:
+                extra += ["[enhanced_fundamentals]"] + lines
+        except Exception:
+            pass
+
+    return (base + "\n" + "\n".join(extra)).strip() if extra else base
+
+
+def _build_v2_timeframe_table(analysis_payload: dict[str, str]) -> str:
+    rows = [
+        ("Short (1-3 months)", analysis_payload.get("TREND_SHORT_1M", "-")),
+        ("Medium (3-6 months)", analysis_payload.get("TREND_MEDIUM_3_6M", "-")),
+        ("Long (6-12 months)", analysis_payload.get("TREND_LONG_6_12M", "-")),
+    ]
+    return "Timeframe Analysis\n" + _format_terminal_table(
+        ["Horizon", "Trend Bias"], rows, col_width=24
+    )
+
+
+def single_stock_analysis_v2(stock_query: str, client) -> str:
+    """
+    v2 comprehensive swing-trade analysis optimised for 1-12 month horizons.
+
+    Key differences from single_stock_analysis (v1):
+    - Calls get_current_ticker_data_v2 (adds weekly chart + quality fundamentals)
+    - Multi-timeframe trend assessment (short / medium / long)
+    - Setup quality grade A-D
+    - Explicit THESIS, KEY_CATALYST, INVALIDATION_TRIGGER fields
+    - Two entry variants: ENTRY_AGGRESSIVE and ENTRY_CONSERVATIVE
+    - HOLDING_PERIOD_ESTIMATE
+    - Larger TP2 multipliers for longer-hold setups
+    """
+    normalized_query = (stock_query or "").strip()
+    if not normalized_query:
+        raise ValueError("stock_query must not be empty")
+
+    logger.info("Running v2 stock analysis for: %s", normalized_query)
+
+    # Step 1: resolve ticker (same logic as v1)
+    step1_payload = _resolve_known_single_instrument_query(normalized_query)
+    if step1_payload:
+        logger.info(
+            "v2 matched built-in alias: %s -> %s",
+            normalized_query,
+            step1_payload["TICKER"],
+        )
+
+    if not step1_payload:
+        prompt1 = f"""
+        You are a market research assistant.
+
+        Task:
+        Use Google Search to identify the most likely Yahoo Finance-compatible tradable instrument
+        that matches the user's query.
+        The query may be a ticker symbol, company name, commodity, ETF, index proxy, or casual shorthand.
+
+        You must:
+        - Identify the best Yahoo Finance-compatible ticker for the asset
+        - Prefer the direct listed instrument when it exists
+        - For commodities or indexes, choose the closest liquid Yahoo Finance-compatible instrument
+          (front-month futures or primary ETF proxy)
+        - Summarize the most relevant recent company, industry, sector, or macro context
+        - Focus on verifiable, recent information
+
+        If there is no clear match, output exactly: NO_MATCH
+
+        Output EXACTLY in this line-based format (no markdown, no extra commentary):
+        QUERY: <repeat the user query>
+        TICKER: <Yahoo Finance-compatible ticker in uppercase>
+        COMPANY: <company name or instrument name>
+        INSTRUMENT_TYPE: <stock, commodity-future, ETF, index-proxy, currency, or other>
+        MATCH_CONFIDENCE: <HIGH, MEDIUM, or LOW>
+        SEARCH_SUMMARY: <max 80 words>
+        RECENT_CATALYSTS: <max 80 words>
+        KEY_RISKS: <max 80 words>
+
+        User query:
+        {normalized_query}
+        """.strip()
+
+        grounding_tool = types.Tool(google_search=types.GoogleSearch())
+        config1 = types.GenerateContentConfig(
+            tools=[grounding_tool],
+            temperature=0.1,
+            thinking_config=types.ThinkingConfig(thinking_level="high"),
+        )
+        resp1 = client.models.generate_content(
+            model="gemini-3.1-pro-preview",
+            contents=prompt1,
+            config=config1,
+        )
+        step1_text = (resp1.text or "").strip()
+        step1_payload = _parse_single_stock_search_result(step1_text)
+        if not step1_payload:
+            logger.info("v2 search step returned no match for: %s", normalized_query)
+            return "NO_MATCH"
+
+    ticker = step1_payload["TICKER"]
+    company = step1_payload["COMPANY"]
+    instrument_type = step1_payload.get("INSTRUMENT_TYPE", "")
+
+    prompt2 = f"""
+    You are a professional swing trader and equity analyst preparing a comprehensive
+    directional trade evaluation for a 1-12 MONTH holding horizon.
+
+    Unlike a short swing trade, this analysis must weigh fundamentals, weekly chart
+    structure, and business quality alongside the near-term technical setup.
+    Longer holding periods reward picking high-quality businesses in bull trends;
+    they punish ignoring the big picture.
+
+    Search context from Step 1:
+    QUERY: {step1_payload.get("QUERY", normalized_query)}
+    TICKER: {ticker}
+    COMPANY: {company}
+    INSTRUMENT_TYPE: {instrument_type}
+    MATCH_CONFIDENCE: {step1_payload.get("MATCH_CONFIDENCE", "")}
+    SEARCH_SUMMARY: {step1_payload.get("SEARCH_SUMMARY", "")}
+    RECENT_CATALYSTS: {step1_payload.get("RECENT_CATALYSTS", "")}
+    KEY_RISKS: {step1_payload.get("KEY_RISKS", "")}
+
+    ═══════════════════════════════════════════════════════════
+    STEP 1 — DATA COLLECTION
+    ═══════════════════════════════════════════════════════════
+    Call get_current_ticker_data_v2 exactly once for ticker {ticker}.
+
+    Key sections and fields to extract:
+
+    price_history       → last_close, atr_14, atr_14_pct, range_20d_high, range_20d_low,
+                          close_vs_20d_high_pct, volume_ratio_vs_20d, recent_bars_10d
+    moving_averages     → sma_20, sma_50, sma_200, close_vs_sma50_pct, trend_structure
+    relative_strength   → signal, composite_score, rrg_quadrant, mrs_52w,
+                          rolling_alpha_annualized_pct
+    market_correlation  → interpretation, beta_6_12m
+    earnings_event      → earnings_date_iso, earnings_in_days
+    analyst_signal      → trend_90d, rating_buckets
+    analyst_price_targets → (use as soft upside reference)
+
+    [NEW in v2]
+    weekly_structure    → sma_20w, sma_40w, close_vs_sma20w_pct, close_vs_sma40w_pct,
+                          weekly_trend_structure, high_52w, low_52w, high_104w, low_104w,
+                          recent_bars_8w
+    enhanced_fundamentals → free_cashflow, operating_cashflow, gross_margins_pct,
+                            operating_margins_pct, return_on_equity, return_on_assets,
+                            current_ratio, peg_ratio, price_to_book
+
+    ═══════════════════════════════════════════════════════════
+    STEP 2 — MULTI-TIMEFRAME TREND ASSESSMENT
+    ═══════════════════════════════════════════════════════════
+    Assess each horizon INDEPENDENTLY and set the corresponding output field.
+
+    SHORT TERM (1-3 months) — daily chart context:
+      BULLISH: price near range_20d_high, above sma_20, above sma_50;
+               recent_bars show higher closes; volume_ratio ≥ 0.8
+      BEARISH: price near range_20d_low, below sma_20; declining closes
+      MIXED:   conflicting or insufficient signals
+
+    MEDIUM TERM (3-6 months) — daily 50/200-day MA and RRG:
+      BULLISH: trend_structure = "price_above_50_above_200"; rrg "leading"/"improving";
+               composite_score ≥ 0
+      BEARISH: trend_structure = "price_below_50_below_200" or "price_below_50_above_200";
+               rrg "lagging"; composite_score < -0.2
+      MIXED:   otherwise
+
+    LONG TERM (6-12 months) — WEEKLY CHART IS PRIMARY:
+      BULLISH: weekly_trend_structure = "price_above_20w_above_40w"
+      MIXED:   "price_above_20w_below_40w" or "price_below_20w_above_40w"
+      BEARISH: "price_below_20w_below_40w"
+      ⚠ A stock BELOW its 40-week MA needs an exceptional catalyst + strong fundamentals
+        to qualify for a 6-12 month long. Apply extra skepticism and cap CONFIDENCE at 6.
+
+    ═══════════════════════════════════════════════════════════
+    STEP 3 — FUNDAMENTAL QUALITY ASSESSMENT
+    ═══════════════════════════════════════════════════════════
+    Use enhanced_fundamentals to assess business quality.
+    Weight these factors for holds > 3 months:
+
+    STRONG quality signals (favour longer hold):
+      • free_cashflow > 0 and growing (positive FCF = self-funding growth)
+      • gross_margins_pct stable or expanding (pricing power)
+      • return_on_equity > 10% (capital efficiency)
+      • peg_ratio < 2.0 (reasonable growth-adjusted valuation)
+      • current_ratio ≥ 1.0 (no near-term cash crunch)
+
+    WEAK quality signals (shorten target horizon or reduce confidence):
+      • free_cashflow < 0 — yellow flag; negative FCF + high valuation = red flag
+      • gross_margins_pct declining — competitive pressure
+      • return_on_equity < 0 — capital destruction
+      • peg_ratio > 3.5 and no near-term catalyst — stretched for 1-year hold
+      • current_ratio < 0.8 — potential liquidity risk
+
+    Combine quality assessment into a qualitative label: STRONG / ADEQUATE / WEAK / UNKNOWN
+    Use WEAK to reduce CONFIDENCE by 1-2 points.
+    Use STRONG to increase CONFIDENCE by 1 point (cap at 10).
+    Do NOT use WEAK fundamentals alone to set BIAS = BEARISH unless other signals confirm.
+
+    ═══════════════════════════════════════════════════════════
+    STEP 4 — OVERALL BIAS DETERMINATION
+    ═══════════════════════════════════════════════════════════
+    Apply the following WEIGHTED signal hierarchy:
+
+    HIGH WEIGHT (50%): Long-term weekly trend (STEP 2 long-term) +
+                       Medium-term daily trend (STEP 2 medium-term)
+    MEDIUM WEIGHT (30%): Fundamental quality (STEP 3) +
+                         Relative strength (composite_score, rrg_quadrant)
+    LOW WEIGHT (20%): Short-term daily setup (STEP 2 short-term)
+
+    BULLISH overall:  Long-term AND medium-term BULLISH, fundamentals ≥ ADEQUATE,
+                      composite_score > -0.2, no earnings within 7 days
+    BEARISH overall:  Long-term OR medium-term BEARISH with no compelling recovery catalyst
+    UNSURE:           Mixed or conflicting timeframes, WEAK fundamentals across all signals,
+                      insufficient data (< 90 days history), or commodity without trend
+
+    ═══════════════════════════════════════════════════════════
+    STEP 5 — SETUP CLASSIFICATION AND QUALITY GRADE
+    ═══════════════════════════════════════════════════════════
+    SETUP_TYPE — pick ONE:
+      breakout              — clearing a multi-week resistance with expanding volume
+      pullback_to_support   — retracing to a prior breakout level, rising MA, or S/R zone
+      base                  — multi-week/month sideways consolidation before potential move
+      momentum_continuation — existing strong trend, no base needed; relative strength leads
+      reversal              — emerging from a downtrend with clear evidence of trend change
+      unsure                — setup unclear or contradictory
+
+    SETUP_QUALITY_GRADE — A / B / C / D:
+      A: All three timeframes BULLISH, clean technical setup, STRONG fundamentals,
+         clear named catalyst, composite_score ≥ 0.3
+      B: Long + medium term BULLISH, setup exists but ≥1 condition mixed,
+         fundamentals ADEQUATE, catalyst identifiable
+      C: Setup works on daily only, weekly neutral/mixed, fundamentals ADEQUATE,
+         catalyst uncertain; confidence ≤ 7
+      D: Conflicting signals, WEAK fundamentals, no clear catalyst → force BIAS = UNSURE
+      Note: Grade D always maps to BIAS = UNSURE.
+
+    ═══════════════════════════════════════════════════════════
+    STEP 6 — LEVEL SETTING
+    ═══════════════════════════════════════════════════════════
+    Levels must be derived from tool data. Do NOT invent numbers.
+
+    BULLISH (LONG) setup:
+
+    ENTRY_AGGRESSIVE:
+      Best-priced entry — at nearest technical support or within 1% of last_close.
+      For pullback setups: just above the support zone.
+      For breakout: current consolidation high or last_close if already breaking out.
+
+    ENTRY_CONSERVATIVE:
+      Confirmation-based entry — above a clear trigger level.
+      Examples: above range_20d_high, above a consolidation resistance, or after a strong
+      weekly close above the 20-week MA.
+      ENTRY_CONSERVATIVE ≥ ENTRY_AGGRESSIVE.
+
+    ENTRY_LEVEL = ENTRY_AGGRESSIVE (primary recommendation and basis for Sharpe calc).
+
+    STOP_LOSS_LEVEL:
+      Below the most recent 10-day swing low OR 2.0×atr_14 below entry — use TIGHTER.
+      Absolute max: 2.5×atr_14 below entry.
+      Also reference low_52w from weekly_structure as an absolute floor backstop.
+
+    TAKE_PROFIT_1:
+      Estimate HOLDING_PERIOD_ESTIMATE first (see STEP 8), then apply:
+      • 1-3m setups: nearer of (next resistance / 52w high) or (2.0×risk above entry)
+      • 3-6m setups: nearer of (high_52w area) or (2.5×risk above entry)
+      • 6-12m setups: high_104w area, analyst price target, or (3.0×risk above entry)
+      MANDATORY: (TP1 - entry) / (entry - stop) ≥ 2.0. If impossible → BIAS = UNSURE.
+
+    TAKE_PROFIT_2:
+      • 1-3m: 3.0×risk above entry
+      • 3-6m: 4.0×risk above entry
+      • 6-12m: 5.0×risk above entry (or measured move target)
+
+    BEARISH (SHORT) setup — mirror the above with reversed direction.
+    TP2 max: 3.0×risk below entry (short upside is capped by zero).
+
+    ═══════════════════════════════════════════════════════════
+    STEP 7 — COMPUTE SHARPE
+    ═══════════════════════════════════════════════════════════
+    Call compute_ex_ante_sharpe(
+        entry=ENTRY_LEVEL,
+        stop_loss=STOP_LOSS_LEVEL,
+        take_profit_1=TAKE_PROFIT_1,
+        take_profit_2=TAKE_PROFIT_2,
+        atr_14=atr_14,
+    )
+    Use result as SHARPE_RATIO. If BIAS = UNSURE → SHARPE_RATIO = UNSURE.
+
+    ═══════════════════════════════════════════════════════════
+    STEP 8 — THESIS, CATALYST, INVALIDATION, HOLDING PERIOD
+    ═══════════════════════════════════════════════════════════
+    THESIS (max 40 words):
+      One sentence: what must be true for this trade to work?
+      Reference the specific setup, business driver, and time element.
+      Example: "AMD pulls back to $140 AI-chip support while datacenter revenue
+      accelerates; institutional accumulation and margin expansion justify a 6-month hold."
+
+    KEY_CATALYST (max 20 words):
+      The single most important upcoming price driver.
+      Example: "Q2 AI revenue beat + raised annual guidance triggers analyst upgrades."
+
+    INVALIDATION_TRIGGER (max 20 words):
+      The specific price level or event that kills the thesis.
+      Example: "Weekly close below $130 swing low OR two consecutive EPS misses."
+
+    HOLDING_PERIOD_ESTIMATE — based on setup type and target distance:
+      breakout / momentum_continuation: 1-3m
+      pullback_to_support with large target: 3-6m
+      base pattern or reversal: 3-6m or 6-12m
+      If long-term trend BULLISH and TP2 ≥ 4×risk: 6-12m
+
+    ═══════════════════════════════════════════════════════════
+    OUTPUT FORMAT — line-based, no markdown, no extra commentary
+    ═══════════════════════════════════════════════════════════
+    QUERY: <user query>
+    TICKER: <ticker>
+    COMPANY: <company or instrument name>
+    BIAS: <BULLISH | BEARISH | UNSURE>
+    TRADE_DIRECTION: <LONG | SHORT | UNSURE>
+    CONFIDENCE: <integer 1-10>
+    SETUP_QUALITY_GRADE: <A | B | C | D>
+    SETUP_TYPE: <breakout | pullback_to_support | base | momentum_continuation | reversal | unsure>
+    SHARPE_RATIO: <number or UNSURE>
+    HOLDING_PERIOD_ESTIMATE: <1-3m | 3-6m | 6-12m | UNSURE>
+    CURRENT_PRICE: <number>
+    CURRENT_PRICE_DATE: <string>
+    ENTRY_AGGRESSIVE: <number or UNSURE>
+    ENTRY_CONSERVATIVE: <number or UNSURE>
+    ENTRY_LEVEL: <number or UNSURE>
+    STOP_LOSS_LEVEL: <number or UNSURE>
+    TAKE_PROFIT_1: <number or UNSURE>
+    TAKE_PROFIT_2: <number or UNSURE>
+    TREND_SHORT_1M: <BULLISH | BEARISH | MIXED>
+    TREND_MEDIUM_3_6M: <BULLISH | BEARISH | MIXED>
+    TREND_LONG_6_12M: <BULLISH | BEARISH | MIXED>
+    THESIS: <one sentence, max 40 words>
+    KEY_CATALYST: <max 20 words>
+    INVALIDATION_TRIGGER: <max 20 words>
+    LEVELS_RATIONALE: <max 90 words: cite specific ATR multiples, weekly MAs, and S/R zones>
+    CONCLUSION: <max 120 words: synthesise timeframe alignment, fundamentals, setup type, and catalyst>
+    UPSIDE_1: <concrete catalyst, max 16 words>
+    UPSIDE_2: <concrete catalyst, max 16 words>
+    UPSIDE_3: <concrete catalyst, max 16 words>
+    UPSIDE_4: <concrete catalyst, max 16 words>
+    UPSIDE_5: <concrete catalyst, max 16 words>
+    DOWNSIDE_1: <concrete risk, max 16 words>
+    DOWNSIDE_2: <concrete risk, max 16 words>
+    DOWNSIDE_3: <concrete risk, max 16 words>
+    DOWNSIDE_4: <concrete risk, max 16 words>
+    DOWNSIDE_5: <concrete risk, max 16 words>
+
+    Level ordering rules:
+    - BULLISH/LONG:  STOP_LOSS_LEVEL < ENTRY_LEVEL ≤ ENTRY_CONSERVATIVE < TAKE_PROFIT_1 < TAKE_PROFIT_2
+    - BEARISH/SHORT: TAKE_PROFIT_2 < TAKE_PROFIT_1 < ENTRY_LEVEL ≤ ENTRY_CONSERVATIVE < STOP_LOSS_LEVEL
+    - UNSURE:        all level and entry fields must be exactly UNSURE
+    - Never output N/A, TBD, null, or placeholder text
+    """.strip()
+
+    config2 = types.GenerateContentConfig(
+        tools=[get_current_ticker_data_v2, compute_ex_ante_sharpe],
+        temperature=0.1,
+        thinking_config=types.ThinkingConfig(thinking_level="high"),
+    )
+
+    resp2 = client.models.generate_content(
+        model="gemini-3.1-pro-preview",
+        contents=prompt2,
+        config=config2,
+    )
+
+    logger.info("v2 stock analysis completed for ticker: %s", ticker)
+    response_text = (resp2.text or "").strip()
+    analysis_payload = _parse_single_stock_analysis_result(response_text)
+    if not analysis_payload:
+        return response_text
+
+    upside_downside_keys = {f"UPSIDE_{i}" for i in range(1, 6)} | {f"DOWNSIDE_{i}" for i in range(1, 6)}
+    main_payload = {k: v for k, v in analysis_payload.items() if k not in upside_downside_keys}
+
+    timeframe_table = _build_v2_timeframe_table(analysis_payload)
+    summary_table = _build_single_stock_summary_section(analysis_payload, step1_payload)
+
+    return (
+        json.dumps(main_payload, indent=2, ensure_ascii=False)
+        + "\n\n"
+        + timeframe_table
+        + "\n\n"
+        + summary_table
+    )
+
+
+def daily_market_analysis_v2(
+    client, current_port: str | None = None, market="US", buying_power=None
+):
+    """
+    v2 daily market scan.
+
+    Stage 1 (identical to v1): Google Search broad scan → up to 10 candidate tickers.
+    Stage 2 (v2): each candidate is evaluated with get_current_ticker_data_v2, applying
+    the same multi-timeframe, fundamental-quality framework as single_stock_analysis_v2
+    (1–12 month swing horizon). Only grade-A/B setups with confidence ≥ 8 are returned.
+    """
+    logger.info("Running v2 daily market analysis")
+    logger.info("v2 daily market analysis market scope: %s", market)
+
+    # -----------------------------------------------------------------------
+    # Stage 1: identical to daily_market_analysis — broad Google Search scan
+    # -----------------------------------------------------------------------
+    prompt1 = f"""
+    You are a professional swing trader and portfolio manager targeting 30–180 day trades.
+
+    Task:
+    Using Google Search and current market knowledge, scan global equity markets for the most
+    compelling swing trade setups available RIGHT NOW.
+
+    Evaluate:
+    - Market regime (risk-on / risk-off, rates, inflation, macro backdrop)
+    - Sector rotation leadership and institutional flow evidence
+    - Earnings momentum (consecutive beats, revenue acceleration, guidance raises)
+    - Theme catalysts (AI, defense, energy transition, healthcare innovation, regulation)
+
+    Setup criteria — candidates SHOULD show at least ONE of:
+    - Base breakout: stock consolidating tightly above support, near a breakout point
+    - Pullback entry: uptrending stock (above 50-day MA) pulling back to rising MA or prior breakout level
+    - Earnings momentum: 2+ consecutive beats with accelerating EPS/revenue, price not yet extended
+    - Sector rotation leader: sector entering bull rotation, stock leading the move with relative strength
+
+    Rejection criteria — EXCLUDE any stock with:
+    - Price in a confirmed downtrend (below 200-day MA with no clear basing pattern)
+    - Earnings within 7 calendar days (unless the entire thesis is the upcoming catalyst)
+    - Microcap or thin volume (prefer market cap >$500M, avg daily volume >500K shares)
+    - No identifiable catalyst — momentum without a reason deteriorates fast
+
+    Universe:
+    - {market} equities only
+    - Highly liquid stocks only
+    - Tickers must be supported by the yfinance Python API
+
+    Objective:
+    Identify up to 10 stock tickers that offer the BEST incremental risk-adjusted swing trade
+    opportunities over the next 30-180 days.
+
+    Rules:
+    - Do NOT invent prices or technical levels
+    - Do NOT propose entries, stops, or targets
+    - Do NOT call any functions
+    - Base conclusions only on recent, verifiable information
+
+    Output rules:
+    If NO stocks qualify, output exactly:
+    no opportunity
+
+    If stocks qualify, output EXACTLY in this 2-line format with no extra text:
+    MARKET_CONTEXT: <one paragraph max 60 words: regime, sector rotation, and dominant setup theme>
+    TICKERS: <comma-separated list of ticker symbols in uppercase>
+    """.strip()
+
+    grounding_tool = types.Tool(google_search=types.GoogleSearch())
+    config1 = types.GenerateContentConfig(
+        tools=[grounding_tool],
+        temperature=0.1,
+        thinking_config=types.ThinkingConfig(thinking_level="high"),
+    )
+
+    resp1 = client.models.generate_content(
+        model="gemini-3.1-pro-preview",
+        contents=prompt1,
+        config=config1,
+    )
+
+    step1_text = (resp1.text or "").strip()
+    if step1_text.lower() == "no opportunity":
+        logger.info("v2 daily market analysis step 1: no opportunity")
+        return "no opportunity"
+
+    market_context = ""
+    tickers_line = ""
+
+    for line in step1_text.splitlines():
+        line = line.strip()
+        if line.upper().startswith("MARKET_CONTEXT:"):
+            market_context = line.split(":", 1)[1].strip()
+        elif line.upper().startswith("TICKERS:"):
+            tickers_line = line.split(":", 1)[1].strip()
+
+    if not tickers_line and "TICKERS:" not in step1_text.upper():
+        tickers_line = step1_text
+
+    tickers = _extract_tickers(tickers_line)
+    if not tickers:
+        logger.info("v2 daily market analysis step 1: no valid tickers")
+        return "no opportunity"
+
+    logger.info("v2 daily market analysis step 1 tickers: %s", ",".join(tickers))
+
+    # -----------------------------------------------------------------------
+    # Stage 2: v2 deep analysis using get_current_ticker_data_v2
+    # -----------------------------------------------------------------------
+    buying_power_line = ""
+    if buying_power is not None:
+        buying_power_line = (
+            f"- Buy order cannot exceed available buying power, currently: {buying_power}"
+        )
+
+    prompt2 = f"""
+    You are a professional swing trader (1–12 month horizon) evaluating a shortlist of candidates.
+    Assess each ticker independently using the v2 multi-timeframe framework. Output ONLY tickers
+    that pass ALL quality filters. Do NOT assume any of them are good trades.
+
+    Market context from the prior scan:
+    {market_context}
+
+    ═══════════════════════════════════════════════════════════
+    STRICT TOOL RULES
+    ═══════════════════════════════════════════════════════════
+    - Call get_current_ticker_data_v2 exactly once per ticker
+    - After setting levels for a viable ticker, call compute_ex_ante_sharpe(entry, stop_loss, tp1, tp2, atr_14)
+    - If data cannot be retrieved for a ticker, discard it silently
+    - Do NOT invent prices or levels — all numbers must come from tool output
+
+    ═══════════════════════════════════════════════════════════
+    KEY DATA TO EXTRACT from each get_current_ticker_data_v2 result
+    ═══════════════════════════════════════════════════════════
+    price_history       → last_close, atr_14, atr_14_pct, avg_volume_20d, last_volume,
+                          volume_ratio_vs_20d, range_20d_high, range_20d_low,
+                          close_vs_20d_high_pct, recent_bars_10d
+    moving_averages     → sma_20, sma_50, sma_200, close_vs_sma50_pct, trend_structure
+    relative_strength   → signal, composite_score, rrg_quadrant, mrs_52w,
+                          rolling_alpha_annualized_pct
+    market_correlation  → interpretation, beta_6_12m
+    fundamentals        → sector, beta, forward_pe, revenue_growth_pct, earnings_growth_pct
+    earnings_event      → earnings_date_iso, earnings_in_days
+    [v2 additions]
+    weekly_structure    → sma_20w, sma_40w, weekly_trend_structure,
+                          high_52w, low_52w, high_104w, low_104w, recent_bars_8w
+    enhanced_fundamentals → free_cashflow, operating_cashflow, gross_margins_pct,
+                            operating_margins_pct, return_on_equity, return_on_assets,
+                            current_ratio, peg_ratio, price_to_book
+
+    ═══════════════════════════════════════════════════════════
+    STEP 1 — MULTI-TIMEFRAME BIAS (assess each horizon independently)
+    ═══════════════════════════════════════════════════════════
+    SHORT (1-3 months) — daily chart:
+      BULLISH: price near range_20d_high, above sma_20 AND sma_50,
+               recent_bars_10d show higher closes, volume_ratio_vs_20d ≥ 0.8
+      BEARISH: price near range_20d_low, below sma_20; declining closes
+      MIXED:   conflicting or insufficient signals
+
+    MEDIUM (3-6 months) — 50/200-day MA and RRG:
+      BULLISH: trend_structure = "price_above_50_above_200"; rrg_quadrant "leading"/"improving";
+               composite_score ≥ 0
+      BEARISH: trend_structure shows price below both MAs; rrg_quadrant "lagging";
+               composite_score < -0.2
+      MIXED:   otherwise
+
+    LONG (6-12 months) — WEEKLY CHART IS PRIMARY:
+      BULLISH: weekly_trend_structure = "price_above_20w_above_40w"
+      MIXED:   "price_above_20w_below_40w" or "price_below_20w_above_40w"
+      BEARISH: "price_below_20w_below_40w"
+      ⚠ A stock BELOW its 40-week MA requires exceptional catalyst + STRONG fundamentals;
+        cap CONFIDENCE at 6 (which fails the ≥ 8 threshold — discard unless truly exceptional).
+
+    ═══════════════════════════════════════════════════════════
+    STEP 2 — FUNDAMENTAL QUALITY ASSESSMENT
+    ═══════════════════════════════════════════════════════════
+    STRONG signals (support higher conviction and longer hold):
+      • free_cashflow > 0
+      • gross_margins_pct stable or expanding
+      • return_on_equity > 10%
+      • peg_ratio < 2.0
+      • current_ratio ≥ 1.0
+
+    WEAK signals (reduce conviction or disqualify):
+      • free_cashflow < 0 AND high valuation
+      • gross_margins_pct declining
+      • return_on_equity < 0
+      • peg_ratio > 3.5 with no near-term catalyst
+      • current_ratio < 0.8
+
+    Quality label: STRONG / ADEQUATE / WEAK / UNKNOWN
+    Apply: WEAK → reduce CONFIDENCE by 1-2; STRONG → increase CONFIDENCE by 1 (cap 10).
+    WEAK fundamentals alone do not set BIAS = BEARISH, but do contribute to discard.
+
+    ═══════════════════════════════════════════════════════════
+    STEP 3 — OVERALL BIAS DETERMINATION
+    ═══════════════════════════════════════════════════════════
+    Weighted signal hierarchy:
+      HIGH (50%):   Long-term weekly trend + medium-term daily trend
+      MEDIUM (30%): Fundamental quality + relative strength (composite_score, rrg_quadrant)
+      LOW (20%):    Short-term daily setup
+
+    BULLISH:  Long-term AND medium-term BULLISH; fundamentals ≥ ADEQUATE;
+              composite_score > -0.2; no earnings within 7 days
+    BEARISH:  Long-term OR medium-term BEARISH with no compelling recovery catalyst
+    DISCARD:  Mixed timeframes; WEAK fundamentals across all signals; insufficient data
+
+    ═══════════════════════════════════════════════════════════
+    STEP 4 — SETUP CLASSIFICATION AND QUALITY GRADE
+    ═══════════════════════════════════════════════════════════
+    SETUP_TYPE (pick one):
+      breakout              — clearing multi-week resistance with expanding volume
+      pullback_to_support   — retracing to prior breakout level, rising MA, or S/R zone
+      base                  — multi-week/month sideways consolidation before potential move
+      momentum_continuation — existing strong trend, no base; relative strength leads
+      reversal              — emerging from downtrend with clear evidence of trend change
+
+    SETUP_QUALITY_GRADE:
+      A: All three timeframes BULLISH, clean technical setup, STRONG fundamentals,
+         clear named catalyst, composite_score ≥ 0.3
+      B: Long + medium term BULLISH; ≥1 condition mixed; fundamentals ADEQUATE;
+         catalyst identifiable
+      C: Daily-only setup, weekly neutral/mixed → DISCARD
+      D: Conflicting signals or WEAK fundamentals → DISCARD
+    Only grades A and B pass. C and D are always discarded.
+
+    ═══════════════════════════════════════════════════════════
+    STEP 5 — HOLDING PERIOD AND LEVEL SETTING
+    ═══════════════════════════════════════════════════════════
+    HOLDING_PERIOD_ESTIMATE based on setup type and target distance:
+      breakout / momentum_continuation: 1-3m
+      pullback_to_support with large target: 3-6m
+      base or reversal: 3-6m or 6-12m
+      If long-term trend BULLISH and TP2 ≥ 4×risk: 6-12m
+
+    Entry (use as buy_in_price):
+      Pullback: at or just above nearest support; within 2% of last_close
+      Breakout: consolidation high + (0.1 × atr_14)
+
+    Stop-loss:
+      Below the most recent 10-day swing low OR 2.0×atr_14 below entry — TIGHTER wins
+      Absolute max: 2.5×atr_14 below entry
+      Reference low_52w from weekly_structure as an absolute floor backstop
+
+    Take-profit scaled to HOLDING_PERIOD_ESTIMATE:
+      1-3m:  TP1 = nearer of (next resistance / high_52w) or (2.0×risk); TP2 = 3.0×risk
+      3-6m:  TP1 = nearer of (high_52w) or (2.5×risk);                   TP2 = 4.0×risk
+      6-12m: TP1 = high_104w or analyst target or (3.0×risk);             TP2 = 5.0×risk
+      MANDATORY: (TP1 − entry) / (entry − stop_loss) ≥ 2.0. If impossible → discard.
+
+    ═══════════════════════════════════════════════════════════
+    QUALITY FILTERS — discard the ticker if ANY of these apply
+    ═══════════════════════════════════════════════════════════
+      - BIAS is not clearly BULLISH
+      - R:R to TP1 < 2.0
+      - Sharpe ratio from compute_ex_ante_sharpe < 0.4
+      - Setup quality grade is C or D
+      - weekly_trend_structure = "price_below_20w_below_40w" (discard unless confidence ≥ 9
+        with an exceptional near-term catalyst AND STRONG fundamentals)
+      - fundamental_quality is WEAK
+      - rrg_quadrant is "lagging" AND there is no overriding near-term catalyst
+      - composite_score < -0.2
+      - volume_ratio_vs_20d < 0.5 on a supposed breakout day
+      - beta_6_12m > 3.0
+      - earnings within 7 days
+
+    PREFERENCE RANKING when multiple setups pass all filters:
+      1. Higher ex-ante Sharpe ratio
+      2. Setup quality grade: A > B
+      3. Longer holding period (6-12m > 3-6m > 1-3m) when Sharpe is equal
+      4. RRG quadrant: leading > improving > weakening
+      5. composite_score (higher = stronger relative strength)
+      6. Catalyst quality and sector alignment with market_context above
+
+    {buying_power_line}
+
+    Output rules:
+    - For an opportunity to be viable it must have Confidence of 8 or higher
+    - Be honest: 8 means high conviction — BULLISH on long AND medium timeframes,
+      grade A or B, clean setup with a named catalyst. Do NOT inflate Confidence to pass.
+      If genuinely uncertain, discard.
+    - If NO ticker passes all quality filters with Confidence ≥ 8, output exactly: no opportunity
+    - If there IS an opportunity, output one JSON object per viable ticker on its own line,
+      with NO extra keys, NO comments, NO markdown:
+    {{
+    "ticker": "STRING",
+    "current_price": NUMBER,
+    "current_price_date": "STRING",
+    "buy_in_price": NUMBER,
+    "stop_loss": NUMBER,
+    "take_profit_1": NUMBER,
+    "take_profit_2": NUMBER,
+    "buy_in_quantity": INTEGER,
+    "Confidence": INTEGER (0-10),
+    "atr_14": NUMBER (from get_current_ticker_data_v2),
+    "sharpe_ratio": NUMBER (from compute_ex_ante_sharpe),
+    "setup_quality_grade": "A" or "B",
+    "holding_period_estimate": "1-3m" or "3-6m" or "6-12m"
+    }}
+
+    Hard constraints:
+    - stop_loss < buy_in_price < take_profit_1 < take_profit_2
+    - (take_profit_1 - buy_in_price) / (buy_in_price - stop_loss) >= 2.0
+    - Output must be ONLY the JSON object(s) or the text "no opportunity" — nothing else
+
+    Tickers to analyze:
+    {", ".join(tickers)}
+    """.strip()
+
+    config2 = types.GenerateContentConfig(
+        tools=[get_current_ticker_data_v2, compute_ex_ante_sharpe],
+        temperature=0.1,
+        thinking_config=types.ThinkingConfig(thinking_level="high"),
+    )
+
+    resp2 = client.models.generate_content(
+        model="gemini-3.1-pro-preview",
+        contents=prompt2,
+        config=config2,
+    )
+
+    logger.info("v2 daily market analysis step 2 completed")
+    return (resp2.text or "").strip()

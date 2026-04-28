@@ -348,20 +348,57 @@ def _run_daily_market_analysis_once() -> None:
         print(raw)
 
 
+def _run_daily_market_analysis_v2_once() -> None:
+    _setup_logging()
+    market = input("Choose market (e.g. US, SWE, POL): ").strip() or "US"
+    client = _build_gemini_client()
+    raw = AIC.daily_market_analysis_v2(client, market=market)
+
+    if raw.strip().lower() == "no opportunity":
+        print(json.dumps({"result": "no opportunity"}, indent=2))
+        return
+
+    objects: list[dict] = []
+    for line in raw.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            if isinstance(obj, dict):
+                objects.append(obj)
+        except json.JSONDecodeError:
+            pass
+
+    if objects:
+        output = objects[0] if len(objects) == 1 else objects
+        print(json.dumps(output, indent=2))
+    else:
+        print(raw)
+
+
 def _run_single_stock_analysis_once(stock_query: str) -> None:
     _setup_logging()
     client = _build_gemini_client()
     print(AIC.single_stock_analysis(stock_query, client))
 
 
+def _run_single_stock_analysis_v2_once(stock_query: str) -> None:
+    _setup_logging()
+    client = _build_gemini_client()
+    print(AIC.single_stock_analysis_v2(stock_query, client))
+
+
 def _print_usage() -> None:
     print("Usage:")
-    print("  python main.py                        # run daily market analysis once (interactive)")
-    print("  python main.py daily-market-analysis")
+    print("  python main.py                           # run daily market analysis once (interactive)")
+    print("  python main.py daily-market-analysis     # v1: 30-180 day swing scan")
+    print("  python main.py daily-market-analysis-v2  # v2: 1-12 month scan, grade A/B setups only")
     print("  python main.py analyze-stock AMD")
     print("  python main.py analyze-asset gold")
-    print("  python main.py AMD                    # shorthand single-asset analysis")
-    print("  python main.py scheduler              # start the scheduler loop")
+    print("  python main.py analyze-stock-v2 AMD      # v2: 1-12 month swing analysis (enhanced)")
+    print("  python main.py AMD                       # shorthand single-asset analysis")
+    print("  python main.py scheduler                 # start the scheduler loop")
 
 
 def _dispatch_cli(argv: list[str]) -> None:
@@ -383,6 +420,10 @@ def _dispatch_cli(argv: list[str]) -> None:
         _run_daily_market_analysis_once()
         return
 
+    if command == "daily-market-analysis-v2":
+        _run_daily_market_analysis_v2_once()
+        return
+
     if command in {"analyze-stock", "analyze-asset"}:
         stock_query = " ".join(argv[1:]).strip()
         if not stock_query:
@@ -390,6 +431,15 @@ def _dispatch_cli(argv: list[str]) -> None:
                 "Usage: python main.py analyze-stock <ticker-or-asset-query>"
             )
         _run_single_stock_analysis_once(stock_query)
+        return
+
+    if command == "analyze-stock-v2":
+        stock_query = " ".join(argv[1:]).strip()
+        if not stock_query:
+            raise SystemExit(
+                "Usage: python main.py analyze-stock-v2 <ticker-or-asset-query>"
+            )
+        _run_single_stock_analysis_v2_once(stock_query)
         return
 
     _run_single_stock_analysis_once(" ".join(argv).strip())
