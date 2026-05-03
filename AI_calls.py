@@ -1,9 +1,11 @@
 from datetime import datetime, timezone
 import json
+import math as _math
 import re
 import logging
 import textwrap
 
+import pandas as pd
 import yfinance as yf
 from google.genai import types
 
@@ -389,14 +391,48 @@ def get_current_ticker_data(ticker: str) -> str:
         or ("FUTURE" if price_history_only else None)
     )
 
+    fetch_ts = datetime.now(timezone.utc)
     lines = [
         f"ticker: {normalized_ticker}",
-        f"as_of: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
+        f"as_of: {fetch_ts.strftime('%Y-%m-%d %H:%M:%S UTC')}",
+        "price_feed_age_seconds: 0",  # data fetched live; validity window is 60 seconds
+        "NOTICE: This data is valid for 60 seconds only. If you are reconsidering this ticker "
+        "after 60s have elapsed since as_of, call get_current_ticker_data_v3 again before setting levels.",
     ]
     if asset_name:
         lines.append(f"asset_name: {asset_name}")
     if quote_type:
         lines.append(f"quote_type: {quote_type}")
+    # Warn when fast_info returns the prior close as last_price (market closed / data stale)
+    lp = fast_info.get("last_price")
+    pc = fast_info.get("previous_close")
+    if lp is not None and pc is not None and abs(float(lp) - float(pc)) < 1e-6:
+        lines.append("price_staleness_warning: last_price equals previous_close — market may be closed or data stale")
+
+    # P0.3 — Catalyst staleness: flag if price moved >2σ or earnings printed in last 14 days
+    try:
+        ph = price_history  # already computed above
+        ret_14d = ph.get("return_14d_pct")
+        cc_vol = ph.get("close_to_close_vol_14d_pct")
+        staleness_flags: list[str] = []
+        if ret_14d is not None and cc_vol is not None and cc_vol > 0:
+            two_sigma_14d = 2.0 * cc_vol * _math.sqrt(14)
+            if abs(ret_14d) > two_sigma_14d:
+                staleness_flags.append(
+                    f"price_moved_2sigma_14d (ret={ret_14d:+.1f}%, 2σ={two_sigma_14d:.1f}%)"
+                )
+        if earnings:
+            days = earnings.get("earnings_in_days")
+            if days is not None and -14 <= int(days) <= -1:
+                staleness_flags.append(f"earnings_printed_recently (earnings_in_days={int(days)})")
+        if staleness_flags:
+            lines.append(
+                "catalyst_staleness_warning: " + "; ".join(staleness_flags)
+                + " — verify catalyst is still forward-looking, not already consumed by the move"
+            )
+    except Exception:
+        pass
+
     if payload:
         lines.append(payload)
     return "\n".join(lines)
@@ -1888,4 +1924,1002 @@ def daily_market_analysis_v2(
     )
 
     logger.info("v2 daily market analysis step 2 completed")
+    return (resp2.text or "").strip()
+
+
+# ===========================================================================
+# v3 additions — institutional 6-step framework
+# ===========================================================================
+
+
+def _classify_regime_deterministically() -> str:
+    """
+    Rule-based macro regime classifier — single source of truth, no LLM required.
+
+    Decision tree (first matching rule wins):
+      VIX > 25                                          → Risk-Off
+      yield_curve < -0.10 %                             → Late-Cycle
+      VIX > 20  OR  HYG 1m-trend < -2 %               → Late-Cycle
+      yield_curve > 0.30 % AND VIX < 16 AND HYG ↑     → Early-Cycle
+      default                                           → Mid-Cycle
+
+    Returns one of: "Early-Cycle" | "Mid-Cycle" | "Late-Cycle" | "Risk-Off"
+    """
+    vix = 20.0  # conservative defaults if fetches fail
+    yield_curve = 0.0
+    hyg_trend_pct = 0.0
+
+    try:
+        vix = float(
+            pd.to_numeric(yf.Ticker("^VIX").history(period="5d")["Close"], errors="coerce")
+            .dropna().iloc[-1]
+        )
+    except Exception:
+        pass
+
+    try:
+        t10 = float(
+            pd.to_numeric(yf.Ticker("^TNX").history(period="5d")["Close"], errors="coerce")
+            .dropna().iloc[-1]
+        )
+        t3m = float(
+            pd.to_numeric(yf.Ticker("^IRX").history(period="5d")["Close"], errors="coerce")
+            .dropna().iloc[-1]
+        )
+        yield_curve = round(t10 - t3m, 3)
+    except Exception:
+        pass
+
+    try:
+        hyg = pd.to_numeric(yf.Ticker("HYG").history(period="3mo")["Close"], errors="coerce").dropna()
+        if len(hyg) > 21:
+            hyg_trend_pct = round((float(hyg.iloc[-1]) / float(hyg.iloc[-22]) - 1) * 100, 2)
+    except Exception:
+        pass
+
+    logger.info(
+        "Deterministic regime inputs: VIX=%.1f yield_curve=%+.3f HYG_1m=%+.1f%%",
+        vix, yield_curve, hyg_trend_pct,
+    )
+
+    if vix > 25:
+        return "Risk-Off"
+    if yield_curve < -0.10 or (vix > 20 and hyg_trend_pct < -2.0):
+        return "Late-Cycle"
+    if vix > 20:
+        return "Late-Cycle"
+    if yield_curve > 0.30 and vix < 16 and hyg_trend_pct > 0:
+        return "Early-Cycle"
+    return "Mid-Cycle"
+
+SECTOR_ETF_MAP: dict[str, str] = {
+    "Technology": "XLK",
+    "Financials": "XLF",
+    "Healthcare": "XLV",
+    "Energy": "XLE",
+    "Industrials": "XLI",
+    "Consumer_Discretionary": "XLY",
+    "Consumer_Staples": "XLP",
+    "Materials": "XLB",
+    "Utilities": "XLU",
+    "Real_Estate": "XLRE",
+    "Communication_Services": "XLC",
+}
+_SECTOR_BENCHMARK = "SPY"
+
+_MACRO_ASSETS: dict[str, str] = {
+    "vix": "^VIX",
+    "us_10y_yield": "^TNX",
+    "us_3m_yield": "^IRX",
+    "dxy_usd": "UUP",
+    "gold": "GC=F",
+    "sp500": "^GSPC",
+    "hy_credit_etf": "HYG",
+    "ig_credit_etf": "LQD",
+}
+
+
+def get_macro_regime_data() -> str:
+    """
+    Step 1 data tool: fetch cross-asset signals for macro regime classification.
+    Returns yield curve, VIX, dollar strength, credit spreads, and safe-haven demand.
+    """
+    lines = [
+        f"macro_regime_snapshot as_of: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+    ]
+
+    for label, ticker in _MACRO_ASSETS.items():
+        try:
+            hist = yf.Ticker(ticker).history(period="6mo", interval="1d")
+            if hist.empty:
+                continue
+            close = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+            if close.empty:
+                continue
+            last = round(float(close.iloc[-1]), 2)
+            chg_1m = chg_3m = None
+            if len(close) > 21:
+                prev = float(close.iloc[-22])
+                chg_1m = round((last / prev - 1) * 100, 2) if prev else None
+            if len(close) > 63:
+                prev3 = float(close.iloc[-64])
+                chg_3m = round((last / prev3 - 1) * 100, 2) if prev3 else None
+            y_hi = round(float(close.tail(252).max()), 2)
+            y_lo = round(float(close.tail(252).min()), 2)
+            pos = round((last - y_lo) / (y_hi - y_lo) * 100, 1) if y_hi != y_lo else None
+            parts = [f"{label} ({ticker}): {last}"]
+            if chg_1m is not None:
+                parts.append(f"1m={chg_1m:+.1f}%")
+            if chg_3m is not None:
+                parts.append(f"3m={chg_3m:+.1f}%")
+            if pos is not None:
+                parts.append(f"52w_pos={pos:.0f}%")
+            lines.append("- " + " ".join(parts))
+        except Exception:
+            continue
+
+    # Yield curve: 10Y minus 3M
+    try:
+        t10 = float(
+            pd.to_numeric(
+                yf.Ticker("^TNX").history(period="5d")["Close"], errors="coerce"
+            ).dropna().iloc[-1]
+        )
+        t3m = float(
+            pd.to_numeric(
+                yf.Ticker("^IRX").history(period="5d")["Close"], errors="coerce"
+            ).dropna().iloc[-1]
+        )
+        spread = round(t10 - t3m, 3)
+        lines.append(
+            f"- yield_curve_10y_minus_3m: {spread:+.3f}% "
+            f"({'INVERTED — recession signal' if spread < 0 else 'positive slope'})"
+        )
+    except Exception:
+        pass
+
+    # HYG/LQD ratio as credit spread proxy
+    try:
+        hyg = pd.to_numeric(
+            yf.Ticker("HYG").history(period="3mo")["Close"], errors="coerce"
+        ).dropna()
+        lqd = pd.to_numeric(
+            yf.Ticker("LQD").history(period="3mo")["Close"], errors="coerce"
+        ).dropna()
+        ratio = (hyg / lqd).dropna()
+        if len(ratio) >= 22:
+            now_r = float(ratio.iloc[-1])
+            prev_r = float(ratio.iloc[-22])
+            chg = round((now_r / prev_r - 1) * 100, 2) if prev_r else None
+            direction = "widening (risk-off)" if (chg is not None and chg < 0) else "tightening (risk-on)"
+            lines.append(
+                f"- hy_ig_spread_proxy (HYG/LQD): {round(now_r, 4)}"
+                + (f" 1m={chg:+.1f}%→{direction}" if chg is not None else "")
+            )
+    except Exception:
+        pass
+
+    return "\n".join(lines)
+
+
+def get_sector_rotation_data() -> str:
+    """
+    Step 2 data tool: compute RS metrics for all 11 SPDR sector ETFs vs SPY.
+    Returns a snapshot ranked by composite relative strength (highest first).
+    """
+    lines = [
+        f"sector_rotation_snapshot as_of: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+    ]
+
+    try:
+        spy_hist = yf.Ticker(_SECTOR_BENCHMARK).history(period="1y", interval="1d")
+    except Exception:
+        return "sector_rotation_snapshot: SPY data unavailable"
+
+    if spy_hist.empty:
+        return "sector_rotation_snapshot: SPY data unavailable"
+
+    results = []
+    for sector, ticker in SECTOR_ETF_MAP.items():
+        try:
+            h = yf.Ticker(ticker).history(period="1y", interval="1d")
+            if h.empty:
+                continue
+            rs = hp.compute_relative_strength(h, spy_hist, index_ticker=_SECTOR_BENCHMARK)
+            close = pd.to_numeric(h["Close"], errors="coerce").dropna()
+            mom_1m = mom_3m = None
+            if len(close) > 21:
+                mom_1m = round((float(close.iloc[-1]) / float(close.iloc[-22]) - 1) * 100, 2)
+            if len(close) > 63:
+                mom_3m = round((float(close.iloc[-1]) / float(close.iloc[-64]) - 1) * 100, 2)
+            results.append({
+                "sector": sector,
+                "ticker": ticker,
+                "rrg_quadrant": rs.rrg_quadrant or "unknown",
+                "composite": rs.composite_score,
+                "mrs_52w": rs.mrs_52w,
+                "alpha_ann_pct": rs.rolling_alpha_annualized_pct,
+                "mom_1m": mom_1m,
+                "mom_3m": mom_3m,
+            })
+        except Exception:
+            continue
+
+    results.sort(key=lambda x: x["composite"] if x["composite"] is not None else -999, reverse=True)
+    lines.append("sectors ranked by composite_rs (highest = most institutional flow):")
+    for r in results:
+        cs = f"{r['composite']:.3f}" if r["composite"] is not None else "n/a"
+        mrs = f"{r['mrs_52w']:.4f}" if r["mrs_52w"] is not None else "n/a"
+        alpha = f"{r['alpha_ann_pct']:+.1f}%" if r["alpha_ann_pct"] is not None else "n/a"
+        m1 = f"{r['mom_1m']:+.1f}%" if r["mom_1m"] is not None else "n/a"
+        lines.append(
+            f"  {r['sector']} ({r['ticker']}): rrg={r['rrg_quadrant']}"
+            f" composite={cs} mrs_52w={mrs} alpha={alpha} mom_1m={m1}"
+        )
+
+    return "\n".join(lines)
+
+
+def get_current_ticker_data_v3(ticker: str) -> str:
+    """
+    v3 = v2 data + [factor_score] section (Steps 3–4 institutional inputs).
+    Adds value_score, quality_score, momentum_score, alpha_score, alpha_quintile.
+    """
+    base = get_current_ticker_data_v2(ticker)
+
+    normalized_ticker = str(ticker).strip().upper()
+    if _uses_price_history_only_market_data(normalized_ticker):
+        return base
+
+    extra: list[str] = []
+    try:
+        data = yf.Ticker(normalized_ticker)
+        info = data.info or {}
+        fundamentals = hp.YFInfoFundamentals.from_yfinance_info(info).to_dict()
+        enhanced = hp.YFEnhancedFundamentals.from_yfinance_info(info).to_dict()
+
+        stock_hist = data.history(period="1y", interval="1d")
+        exchange = info.get("exchange")
+        index = _resolve_market_index_ticker(exchange=exchange, ticker=normalized_ticker)
+        momentum_composite = None
+        if index:
+            try:
+                idx_hist = yf.Ticker(index).history(period="1y", interval="1d")
+                rs = hp.compute_relative_strength(stock_hist, idx_hist, index_ticker=index)
+                momentum_composite = rs.composite_score
+            except Exception:
+                pass
+
+        fs = hp.YFFactorScore.compute(fundamentals, enhanced, momentum_composite)
+        lines = [f"- {k}: {v}" for k, v in fs.to_dict().items() if v is not None]
+        if lines:
+            extra = ["[factor_score]"] + lines
+    except Exception:
+        pass
+
+    return (base + "\n" + "\n".join(extra)).strip() if extra else base
+
+
+def _parse_v3_stage1(text: str) -> dict[str, str]:
+    result = {
+        "regime": "",
+        "beta_target": "",
+        "approved_sectors": "",
+        "rejected_sectors": "",
+        "market_context": "",
+        "sector_earnings_events": "",
+        "tickers_line": "",
+    }
+    key_map = {
+        "REGIME": "regime",
+        "BETA_TARGET": "beta_target",
+        "APPROVED_SECTORS": "approved_sectors",
+        "REJECTED_SECTORS": "rejected_sectors",
+        "MARKET_CONTEXT": "market_context",
+        "SECTOR_EARNINGS_EVENTS": "sector_earnings_events",
+        "TICKERS": "tickers_line",
+    }
+    for line in (text or "").splitlines():
+        line = line.strip()
+        for prefix, dest in key_map.items():
+            if line.upper().startswith(prefix + ":"):
+                result[dest] = line.split(":", 1)[1].strip()
+                break
+    return result
+
+
+def _build_v3_institutional_table(analysis_payload: dict[str, str]) -> str:
+    rows = [
+        ("1. Macro Regime", f"{analysis_payload.get('REGIME', '-')} | Alignment: {analysis_payload.get('REGIME_ALIGNMENT', '-')}"),
+        ("2. Sector / Capital Flow", f"{analysis_payload.get('SECTOR_STATUS', '-')}"),
+        ("3. Liquidity Gate", analysis_payload.get("LIQUIDITY_GATE", "-")),
+        (
+            "4. Factor Score",
+            f"Alpha={analysis_payload.get('ALPHA_SCORE', '-')} Q{analysis_payload.get('ALPHA_QUINTILE', '-')} | "
+            f"Val={analysis_payload.get('VALUE_SCORE', '-')} Qual={analysis_payload.get('QUALITY_SCORE', '-')} "
+            f"Mom={analysis_payload.get('MOMENTUM_SCORE', '-')}",
+        ),
+        (
+            "5. Catalyst",
+            f"{analysis_payload.get('CATALYST_TYPE', '-')}: {analysis_payload.get('KEY_CATALYST', '-')}",
+        ),
+        (
+            "6. Position / Risk",
+            f"Grade={analysis_payload.get('SETUP_QUALITY_GRADE', '-')} | "
+            f"{analysis_payload.get('HOLDING_PERIOD_ESTIMATE', '-')} | "
+            f"Sharpe={analysis_payload.get('SHARPE_RATIO', '-')}",
+        ),
+    ]
+    return "Institutional 6-Step Analysis\n" + _format_terminal_table(
+        ["Framework Step", "Assessment"], rows, col_width=44
+    )
+
+
+def single_stock_analysis_v3(stock_query: str, client) -> str:
+    """
+    Institutional 6-step single-asset analysis (v3).
+
+    Step 1: macro regime via get_macro_regime_data()
+    Step 2: sector rotation via get_sector_rotation_data()
+    Step 3: liquidity gate from ticker data
+    Step 4: factor score from [factor_score] section
+    Step 5: catalyst identification
+    Step 6: level-setting + position sizing (v2 multi-timeframe methodology)
+    """
+    normalized_query = (stock_query or "").strip()
+    if not normalized_query:
+        raise ValueError("stock_query must not be empty")
+
+    logger.info("Running v3 institutional stock analysis for: %s", normalized_query)
+
+    # Stage 1: resolve ticker (same as v1/v2)
+    step1_payload = _resolve_known_single_instrument_query(normalized_query)
+    if step1_payload:
+        logger.info("v3 matched built-in alias: %s -> %s", normalized_query, step1_payload["TICKER"])
+
+    if not step1_payload:
+        prompt1 = f"""
+        You are a market research assistant.
+
+        Task:
+        Use Google Search to identify the most likely Yahoo Finance-compatible tradable instrument
+        that matches the user's query.
+        The query may be a ticker symbol, company name, commodity, ETF, index proxy, or casual shorthand.
+
+        You must:
+        - Identify the best Yahoo Finance-compatible ticker for the asset
+        - Prefer the direct listed instrument when it exists
+        - For commodities or indexes, choose the closest liquid Yahoo Finance-compatible instrument
+          (front-month futures or primary ETF proxy)
+        - Summarize the most relevant recent company, industry, sector, or macro context
+        - Focus on verifiable, recent information
+
+        If there is no clear match, output exactly: NO_MATCH
+
+        Output EXACTLY in this line-based format (no markdown, no extra commentary):
+        QUERY: <repeat the user query>
+        TICKER: <Yahoo Finance-compatible ticker in uppercase>
+        COMPANY: <company name or instrument name>
+        INSTRUMENT_TYPE: <stock, commodity-future, ETF, index-proxy, currency, or other>
+        MATCH_CONFIDENCE: <HIGH, MEDIUM, or LOW>
+        SEARCH_SUMMARY: <max 80 words>
+        RECENT_CATALYSTS: <max 80 words>
+        KEY_RISKS: <max 80 words>
+
+        User query:
+        {normalized_query}
+        """.strip()
+
+        grounding_tool = types.Tool(google_search=types.GoogleSearch())
+        config1 = types.GenerateContentConfig(
+            tools=[grounding_tool],
+            temperature=0.1,
+            thinking_config=types.ThinkingConfig(thinking_level="high"),
+        )
+        resp1 = client.models.generate_content(
+            model="gemini-3.1-pro-preview",
+            contents=prompt1,
+            config=config1,
+        )
+        step1_text = (resp1.text or "").strip()
+        step1_payload = _parse_single_stock_search_result(step1_text)
+        if not step1_payload:
+            logger.info("v3 search step returned no match for: %s", normalized_query)
+            return "NO_MATCH"
+
+    ticker = step1_payload["TICKER"]
+    company = step1_payload["COMPANY"]
+    instrument_type = step1_payload.get("INSTRUMENT_TYPE", "")
+
+    # Stage 2: full 6-step institutional analysis
+    prompt2 = f"""
+    You are a systematic institutional analyst applying the full 6-step framework to a single asset.
+
+    Asset from Step 1 identification:
+    TICKER: {ticker}
+    COMPANY: {company}
+    INSTRUMENT_TYPE: {instrument_type}
+    SEARCH_SUMMARY: {step1_payload.get("SEARCH_SUMMARY", "")}
+    RECENT_CATALYSTS: {step1_payload.get("RECENT_CATALYSTS", "")}
+    KEY_RISKS: {step1_payload.get("KEY_RISKS", "")}
+
+    ═══════════════════════════════════════════════════════════
+    STEP 1 — MACRO REGIME CONTEXT
+    ═══════════════════════════════════════════════════════════
+    Call get_macro_regime_data() to retrieve cross-asset signals.
+    Classify the regime into one of:
+      Early-Cycle  — spreads tightening, yield curve positive, VIX declining, broad participation
+      Mid-Cycle    — stable growth, VIX 12–18, moderate rates
+      Late-Cycle   — yield curve flattening/inverting, spreads widening, rotation to defensives
+      Risk-Off     — VIX >25, spreads wide, USD strong, gold bid
+
+    Set REGIME_ALIGNMENT for this specific asset:
+      ALIGNED    — asset class benefits from the current regime
+      NEUTRAL    — regime neither helps nor hurts this asset
+      MISALIGNED — regime works against this asset (e.g., growth stock in Risk-Off)
+
+    ═══════════════════════════════════════════════════════════
+    STEP 2 — SECTOR ROTATION AND CAPITAL FLOW
+    ═══════════════════════════════════════════════════════════
+    Call get_sector_rotation_data().
+    Find the sector this stock belongs to and classify:
+      approved           — rrg_quadrant "leading" or "improving" AND composite ≥ -0.05
+      rejected           — rrg_quadrant "lagging" AND composite < -0.10
+      neutral            — all other cases
+      n_a                — commodity, ETF, or sector not in the map
+
+    ═══════════════════════════════════════════════════════════
+    STEP 3 — LIQUIDITY GATE
+    ═══════════════════════════════════════════════════════════
+    Call get_current_ticker_data_v3 for ticker {ticker}.
+
+    FAIL (set BIAS=UNSURE and LIQUIDITY_GATE=FAIL) if:
+    - avg_volume_20d < 100,000
+    - last_price < 0.50
+    Otherwise set LIQUIDITY_GATE=PASS.
+
+    ═══════════════════════════════════════════════════════════
+    STEP 4 — FACTOR SCORE ASSESSMENT
+    ═══════════════════════════════════════════════════════════
+    From the [factor_score] section of get_current_ticker_data_v3:
+    - Report alpha_quintile, alpha_score, value_score, quality_score, momentum_score
+    - If alpha_quintile ≤ 2 (bottom 40%): reduce CONFIDENCE by 2 points
+    - If alpha_quintile = 5 (top 20%): add 1 to CONFIDENCE (cap 10)
+    For commodities/futures: set all factor scores to n/a; no confidence adjustment.
+
+    ═══════════════════════════════════════════════════════════
+    STEP 5 — CATALYST IDENTIFICATION
+    ═══════════════════════════════════════════════════════════
+    From earnings_event, analyst_signal, analyst_price_targets, and search context:
+    Identify and name the specific catalyst that will force market re-pricing within 30–180 days.
+    Classify CATALYST_TYPE as exactly one of:
+      earnings | guidance | sector_theme | analyst_upgrade | technical_breakout | macro_driven
+
+    ═══════════════════════════════════════════════════════════
+    STEP 6 — MULTI-TIMEFRAME ANALYSIS AND LEVEL SETTING
+    ═══════════════════════════════════════════════════════════
+    Assess each horizon independently:
+
+    SHORT (1-3m) — daily chart:
+      BULLISH: price near range_20d_high, above sma_20 AND sma_50, volume_ratio ≥ 0.8
+      BEARISH: price near range_20d_low, below sma_20
+      MIXED:   conflicting or insufficient
+
+    MEDIUM (3-6m) — 50/200-day MA and RRG:
+      BULLISH: trend_structure = "price_above_50_above_200"; rrg "leading"/"improving"
+      BEARISH: price below both MAs; rrg "lagging"
+      MIXED:   otherwise
+
+    LONG (6-12m) — WEEKLY CHART IS PRIMARY:
+      BULLISH: weekly_trend_structure = "price_above_20w_above_40w"
+      MIXED:   one MA above, one below
+      BEARISH: "price_below_20w_below_40w"
+
+    Overall BIAS (weighted: long 50%, medium 30%, short 20%):
+      BULLISH: long AND medium BULLISH; composite_score > -0.2; no earnings within 7 days
+      BEARISH: long OR medium BEARISH with no compelling recovery catalyst
+      UNSURE:  mixed timeframes, WEAK fundamentals across all signals, or liquidity fail
+
+    Entry / Stop / Take-profit (scale to holding period):
+      ENTRY_AGGRESSIVE: at support or within 1% of last_close (pullback) / consolidation_high + 0.1×atr (breakout)
+      ENTRY_CONSERVATIVE: above a clear trigger level
+      STOP_LOSS: below 10-day swing low OR 2.0×atr_14 — TIGHTER wins; max 2.5×atr_14
+      TP1/TP2 by holding period:
+        1-3m:  TP1 = nearer of (next resistance / high_52w) or (2.0×risk); TP2 = 3.0×risk
+        3-6m:  TP1 = nearer of (high_52w) or (2.5×risk);                   TP2 = 4.0×risk
+        6-12m: TP1 = high_104w or analyst target or (3.0×risk);             TP2 = 5.0×risk
+      MANDATORY: (TP1 − entry) / (entry − stop) ≥ 2.0; if impossible → BIAS = UNSURE
+
+    After setting levels, call compute_ex_ante_sharpe(entry, stop_loss, tp1, tp2, atr_14).
+
+    ═══════════════════════════════════════════════════════════
+    OUTPUT FORMAT — line-based, no markdown, no extra commentary
+    ═══════════════════════════════════════════════════════════
+    REGIME: <Early-Cycle | Mid-Cycle | Late-Cycle | Risk-Off>
+    REGIME_ALIGNMENT: <ALIGNED | NEUTRAL | MISALIGNED>
+    SECTOR_STATUS: <approved | rejected | neutral | n_a>
+    LIQUIDITY_GATE: <PASS | FAIL>
+    ALPHA_SCORE: <number or n/a>
+    ALPHA_QUINTILE: <1-5 or n/a>
+    VALUE_SCORE: <number or n/a>
+    QUALITY_SCORE: <number or n/a>
+    MOMENTUM_SCORE: <number or n/a>
+    CATALYST_TYPE: <earnings | guidance | sector_theme | analyst_upgrade | technical_breakout | macro_driven>
+    QUERY: <user query>
+    TICKER: <ticker>
+    COMPANY: <company or instrument name>
+    BIAS: <BULLISH | BEARISH | UNSURE>
+    TRADE_DIRECTION: <LONG | SHORT | UNSURE>
+    CONFIDENCE: <integer 1-10>
+    SETUP_QUALITY_GRADE: <A | B | C | D>
+    SETUP_TYPE: <breakout | pullback_to_support | base | momentum_continuation | reversal | unsure>
+    SHARPE_RATIO: <number or UNSURE>
+    HOLDING_PERIOD_ESTIMATE: <1-3m | 3-6m | 6-12m | UNSURE>
+    CURRENT_PRICE: <number>
+    CURRENT_PRICE_DATE: <string>
+    ENTRY_AGGRESSIVE: <number or UNSURE>
+    ENTRY_CONSERVATIVE: <number or UNSURE>
+    ENTRY_LEVEL: <number or UNSURE>
+    STOP_LOSS_LEVEL: <number or UNSURE>
+    TAKE_PROFIT_1: <number or UNSURE>
+    TAKE_PROFIT_2: <number or UNSURE>
+    TREND_SHORT_1M: <BULLISH | BEARISH | MIXED>
+    TREND_MEDIUM_3_6M: <BULLISH | BEARISH | MIXED>
+    TREND_LONG_6_12M: <BULLISH | BEARISH | MIXED>
+    THESIS: <one sentence, max 40 words — what must be true for this trade to work>
+    KEY_CATALYST: <max 20 words>
+    INVALIDATION_TRIGGER: <max 20 words>
+    LEVELS_RATIONALE: <max 90 words: cite ATR multiples, weekly MAs, S/R zones>
+    CONCLUSION: <max 120 words: synthesise regime alignment, factor score, setup, and catalyst>
+    UPSIDE_1: <concrete catalyst, max 16 words>
+    UPSIDE_2: <concrete catalyst, max 16 words>
+    UPSIDE_3: <concrete catalyst, max 16 words>
+    UPSIDE_4: <concrete catalyst, max 16 words>
+    UPSIDE_5: <concrete catalyst, max 16 words>
+    DOWNSIDE_1: <concrete risk, max 16 words>
+    DOWNSIDE_2: <concrete risk, max 16 words>
+    DOWNSIDE_3: <concrete risk, max 16 words>
+    DOWNSIDE_4: <concrete risk, max 16 words>
+    DOWNSIDE_5: <concrete risk, max 16 words>
+
+    Level ordering rules:
+    - BULLISH/LONG:  STOP_LOSS < ENTRY ≤ ENTRY_CONSERVATIVE < TP1 < TP2
+    - BEARISH/SHORT: TP2 < TP1 < ENTRY ≤ ENTRY_CONSERVATIVE < STOP_LOSS
+    - UNSURE:        all level/entry fields = UNSURE
+    - Never output N/A, TBD, null, or placeholder text
+    """.strip()
+
+    config2 = types.GenerateContentConfig(
+        tools=[get_macro_regime_data, get_sector_rotation_data,
+               get_current_ticker_data_v3, compute_ex_ante_sharpe],
+        temperature=0.1,
+        thinking_config=types.ThinkingConfig(thinking_level="high"),
+    )
+
+    resp2 = client.models.generate_content(
+        model="gemini-3.1-pro-preview",
+        contents=prompt2,
+        config=config2,
+    )
+
+    logger.info("v3 institutional stock analysis completed for ticker: %s", ticker)
+    response_text = (resp2.text or "").strip()
+    analysis_payload = _parse_single_stock_analysis_result(response_text)
+    if not analysis_payload:
+        return response_text
+
+    upside_downside_keys = {f"UPSIDE_{i}" for i in range(1, 6)} | {f"DOWNSIDE_{i}" for i in range(1, 6)}
+    main_payload = {k: v for k, v in analysis_payload.items() if k not in upside_downside_keys}
+
+    institutional_table = _build_v3_institutional_table(analysis_payload)
+    timeframe_table = _build_v2_timeframe_table(analysis_payload)
+    summary_table = _build_single_stock_summary_section(analysis_payload, step1_payload)
+
+    return (
+        json.dumps(main_payload, indent=2, ensure_ascii=False)
+        + "\n\n"
+        + institutional_table
+        + "\n\n"
+        + timeframe_table
+        + "\n\n"
+        + summary_table
+    )
+
+
+def daily_market_analysis_v3(
+    client, current_port: str | None = None, market: str = "US", buying_power=None
+) -> str:
+    """
+    Institutional 6-step daily market scan (v3).
+
+    Stage 1 (Steps 1-2): macro regime + sector rotation + Google Search → candidate tickers.
+    Stage 2 (Steps 3-6): per-ticker liquidity, factor, catalyst, and portfolio construction.
+    Only grade-A/B setups with Confidence ≥ 8 are returned.
+    """
+    logger.info("Running v3 institutional daily market analysis, market=%s", market)
+
+    # Deterministic regime pre-computed from raw market data — no LLM needed for this
+    det_regime = _classify_regime_deterministically()
+    logger.info("Deterministic regime pre-classification: %s", det_regime)
+
+    # -----------------------------------------------------------------------
+    # Stage 1: macro regime + sector rotation + candidate ticker identification
+    # -----------------------------------------------------------------------
+    prompt1 = f"""
+    You are an institutional portfolio manager running a systematic 6-step market scan.
+    Apply steps 1 and 2 to identify the best swing trade candidates (30–180 day horizon).
+
+    DETERMINISTIC REGIME PRE-COMPUTED: {det_regime}
+    (Derived from VIX, yield curve, and HYG credit-spread rules. Use this as your default.
+    You may override ONLY if the macro data signals are strongly inconsistent with it and
+    you can cite the specific conflicting metrics. If uncertain, use the pre-computed value.)
+
+    ═══════════════════════════════════════════════════════════
+    STEP 1 — MACRO REGIME CLASSIFICATION
+    ═══════════════════════════════════════════════════════════
+    Call get_macro_regime_data() to retrieve cross-asset signals.
+
+    Classify the regime into EXACTLY ONE of:
+      Early-Cycle  — credit spreads tightening, yield curve positive slope,
+                     VIX declining from elevated levels, broad market participation
+                     → BETA_TARGET 1.1–1.3
+      Mid-Cycle    — stable growth, rates moderate, spreads stable, VIX 12–18
+                     → BETA_TARGET 0.9–1.1
+      Late-Cycle   — yield curve flattening or inverted, spreads widening,
+                     rotation toward defensives/staples/utilities
+                     → BETA_TARGET 0.6–0.9
+      Risk-Off     — VIX >25, spreads wide, USD strong, gold bid, equity distribution
+                     → BETA_TARGET 0.0–0.5
+
+    ═══════════════════════════════════════════════════════════
+    STEP 2 — SECTOR ROTATION AND CAPITAL FLOW
+    ═══════════════════════════════════════════════════════════
+    Call get_sector_rotation_data() to identify institutional capital flows.
+
+    APPROVED sectors: rrg_quadrant = "leading" OR rrg_quadrant = "improving"
+    REJECTED sectors: rrg_quadrant = "lagging" OR rrg_quadrant = "weakening"
+      (weakening = RS turning down from strength — do NOT allow through; it is where
+       leadership ends, not where it begins)
+    In Risk-Off regime: also approve Consumer_Staples, Utilities, Healthcare regardless of RS.
+
+    Then use Google Search to identify specific stock candidates from APPROVED sectors.
+    Setup criteria — candidates SHOULD show at least ONE of:
+    - Base breakout: consolidating above support, near breakout
+    - Pullback entry: uptrending stock pulling back to rising MA
+    - Earnings momentum: 2+ consecutive beats with accelerating EPS/revenue
+    - Sector rotation leader: stock leading sector move with strong relative strength
+
+    Rejection criteria — EXCLUDE any stock with:
+    - Confirmed downtrend (below 200-day MA, no basing pattern)
+    - Earnings within 7 calendar days
+    - Market cap <$500M or avg daily volume <500K shares
+    - No identifiable catalyst
+
+    Universe: {market} equities only — tickers must work with the yfinance Python API.
+    Identify up to 15 candidates.
+
+    ═══════════════════════════════════════════════════════════
+    SECTOR EARNINGS CALENDAR (next 5 calendar days)
+    ═══════════════════════════════════════════════════════════
+    Use Google Search to identify major companies (market cap > $50B) reporting earnings
+    in the next 5 calendar days that could materially move the APPROVED sectors above.
+    Focus on sector-defining names whose results set the tone for peers:
+    e.g., hyperscalers (MSFT, GOOGL, META, AMZN, AAPL) for AI/tech semis;
+    major banks for financials; oil majors for energy; retailers for consumer.
+    Include any company whose capex guidance, revenue beat/miss, or forward outlook
+    would directly affect the pricing of stocks in APPROVED sectors.
+
+    Output EXACTLY in this format (no markdown):
+    REGIME: <Early-Cycle | Mid-Cycle | Late-Cycle | Risk-Off>
+    BETA_TARGET: <number>
+    APPROVED_SECTORS: <comma-separated list>
+    REJECTED_SECTORS: <comma-separated list>
+    MARKET_CONTEXT: <max 60 words: regime, sector leaders, dominant theme>
+    SECTOR_EARNINGS_EVENTS: <semicolon-separated entries "TICKER|DATE|THEME" e.g. "MSFT|2026-04-29|AI-capex;META|2026-04-30|ad-revenue", or: none>
+    TICKERS: <comma-separated uppercase tickers, or: no opportunity>
+    """.strip()
+
+    grounding_tool = types.Tool(google_search=types.GoogleSearch())
+    config1 = types.GenerateContentConfig(
+        tools=[grounding_tool, get_macro_regime_data, get_sector_rotation_data],
+        tool_config=types.ToolConfig(include_server_side_tool_invocations=True),
+        temperature=0.1,
+        thinking_config=types.ThinkingConfig(thinking_level="high"),
+    )
+
+    resp1 = client.models.generate_content(
+        model="gemini-3.1-pro-preview",
+        contents=prompt1,
+        config=config1,
+    )
+
+    step1_text = (resp1.text or "").strip()
+    parsed1 = _parse_v3_stage1(step1_text)
+
+    regime = parsed1["regime"] or "Mid-Cycle"
+    beta_target = parsed1["beta_target"] or "1.0"
+    approved_sectors = parsed1["approved_sectors"] or ""
+    market_context = parsed1["market_context"] or ""
+    sector_earnings_events = parsed1["sector_earnings_events"] or "none"
+    tickers_line = parsed1["tickers_line"]
+
+    if tickers_line.lower() == "no opportunity" or not tickers_line:
+        logger.info("v3 daily market analysis stage 1: no opportunity")
+        return "no opportunity"
+
+    tickers = _extract_tickers(tickers_line)
+    if not tickers:
+        logger.info("v3 daily market analysis stage 1: no valid tickers parsed")
+        return "no opportunity"
+
+    logger.info("v3 stage 1 regime=%s tickers=%s", regime, ",".join(tickers))
+
+    # -----------------------------------------------------------------------
+    # Stage 2: steps 3–6 — liquidity filter, factor scoring, catalyst, levels
+    # -----------------------------------------------------------------------
+    buying_power_line = (
+        f"- Buy order cannot exceed available buying power, currently: {buying_power}"
+        if buying_power is not None
+        else ""
+    )
+
+    prompt2 = f"""
+    You are a systematic institutional analyst. Apply steps 3–6 of the institutional
+    framework to evaluate the candidate tickers below. Output ONLY tickers that pass
+    ALL filters. Do NOT assume any of them are good trades.
+
+    Market regime context from Steps 1–2:
+    REGIME: {regime}
+    BETA_TARGET: {beta_target}
+    APPROVED_SECTORS: {approved_sectors}
+    MARKET_CONTEXT: {market_context}
+    SECTOR_EARNINGS_EVENTS: {sector_earnings_events}
+
+    ═══════════════════════════════════════════════════════════
+    STRICT TOOL RULES
+    ═══════════════════════════════════════════════════════════
+    - Call get_current_ticker_data_v3 exactly once per ticker
+    - After setting levels for a viable ticker, call:
+        compute_ex_ante_sharpe(entry, stop_loss, tp1, tp2, atr_14,
+                               realized_vol_pct, setup_grade)
+      where:
+        realized_vol_pct = close_to_close_vol_14d_pct from [price_history] section (pass 0 if missing)
+        setup_grade      = your SETUP_QUALITY_GRADE ("A" or "B")
+    - Do NOT invent prices or levels — all numbers from tool output only
+
+    ═══════════════════════════════════════════════════════════
+    STEP 3 — LIQUIDITY AND EARNINGS FILTER (BINARY GATE)
+    ═══════════════════════════════════════════════════════════
+    Reject immediately if ANY of the following apply:
+    - avg_volume_20d < 500,000
+    - market_cap < 500,000,000 (< $500M)
+    - last_price < 3.00
+    - earnings_in_days is between 0 and 10 inclusive
+
+    CRITICAL — earnings data reliability:
+    - If earnings_in_days is null/missing in the data OR earnings_date_source is "unknown",
+      the ticker's next earnings date is UNCONFIRMED.
+      You MUST use Google Search to verify the actual next earnings date for that ticker.
+      If the confirmed date is within 10 days, REJECT.
+      If you cannot confirm the date is more than 10 days away, REJECT.
+    - If price_staleness_warning is present in the data, note it in CONCLUSION.
+      Do NOT use a stale last_price as an entry price — use the most recent
+      close from recent_bars_10d instead.
+
+    CATALYST STALENESS (P0.3) — REJECT immediately if:
+    - catalyst_staleness_warning contains "price_moved_2sigma_14d" AND the ticker's
+      primary catalyst is "earnings", "guidance", or "analyst_upgrade".
+      A 2σ move in 14 days means the market has likely already priced the catalyst.
+      The setup has no forward-looking edge; require a NEW catalyst distinct from the one
+      already consumed by the move.
+    - catalyst_staleness_warning contains "earnings_printed_recently" AND the thesis
+      relies on the next earnings beat (catalyst_type = "earnings").
+      The reported quarter is behind us; the forward catalyst must be explicitly named
+      (e.g., next earnings date, specific guidance event, product launch).
+
+    ═══════════════════════════════════════════════════════════
+    STEP 3.5 — SECTOR EARNINGS TIMING
+    ═══════════════════════════════════════════════════════════
+    Review SECTOR_EARNINGS_EVENTS above. For each candidate ticker still in consideration:
+
+    A) Determine THESIS_EARNINGS_DEPENDENT:
+       - TRUE  if the stock's primary thesis relies on results from any event in
+                SECTOR_EARNINGS_EVENTS (e.g. NVDA/AMD/AVGO thesis relies on hyperscaler
+                AI-capex guidance from MSFT/GOOGL/META/AMZN; bank stocks rely on
+                peer bank credit results).
+       - FALSE if the thesis is self-contained (company-specific catalyst, technical
+                setup, or sector theme unrelated to the listed events).
+
+    B) Set ENTRY_TIMING based on the combination of (A) and earnings proximity:
+       - "immediate"
+           Thesis is FALSE (not dependent), OR the correlated event already printed
+           and the reaction was clearly positive for this stock's thesis.
+       - "wait_for_sector_print"
+           Thesis is TRUE AND the correlated event has NOT yet printed.
+           Do NOT enter before the print — the event is the dominant variable.
+           If entered now, the position is a directional earnings bet, not a swing setup.
+       - "post_confirmation"
+           Correlated event printed but the reaction is ambiguous or not yet fully
+           absorbed (e.g., stock gapped up but is still in the first session after print).
+           Wait one full session for price discovery before entering.
+
+    C) If ENTRY_TIMING = "wait_for_sector_print":
+       - Keep the ticker in the output (do not discard it — the setup may still be valid)
+       - Set buy_in_price to the anticipated post-event entry level (e.g., breakout above
+         a key resistance level that would only be triggered by a positive print)
+       - Reduce CONFIDENCE by 1 (timing uncertainty)
+       - Note in CONCLUSION: "Entry contingent on [EVENT_TICKER] earnings beat on [DATE]"
+
+    D) Exception — enter BEFORE the print only if ALL three hold:
+       1. Consensus EPS/revenue estimate implies a beat is highly probable (≥ 70% historical beat rate,
+          strong buy-side whisper, or management pre-announced guidance raise)
+       2. The stock has already been pulling back and is at a defined technical support
+          (not chasing into the event)
+       3. The correlated event is the PRIMARY catalyst, not a tail risk
+
+    ═══════════════════════════════════════════════════════════
+    STEP 4 — FACTOR SCREENING AND OVEREXTENSION CHECK
+    ═══════════════════════════════════════════════════════════
+    From [factor_score] section of get_current_ticker_data_v3:
+    Advance only if:
+      alpha_quintile ≥ 4 (top 40%)
+      OR (momentum_score > 0.3 AND quality_score ≥ 0)
+      OR (alpha_score > 0.1 AND rrg_quadrant = "leading")
+    Reject if alpha_quintile = 1 (bottom 20%) without an exceptional imminent catalyst.
+
+    Overextension check (apply to every ticker regardless of factor score):
+    - If close_vs_sma200_pct > 50%: reduce CONFIDENCE by 2 and set SETUP_QUALITY_GRADE
+      to at most B (cannot be A). Note "price extended >50% above 200-day MA".
+    - If close_vs_sma200_pct > 30% AND alpha_quintile ≤ 3: reduce CONFIDENCE by 1.
+    These adjustments are in addition to other confidence rules.
+
+    ═══════════════════════════════════════════════════════════
+    STEP 5 — CATALYST VERIFICATION
+    ═══════════════════════════════════════════════════════════
+    Require at least ONE identifiable catalyst driving repricing within 30–180 days:
+    - Earnings beat cycle (2+ consecutive beats, next report > 7 days away)
+    - Analyst upgrade cycle (trend_90d = "improving", price target upside > 20%)
+    - Forward guidance revision (positive revision signals in search context)
+    - Sector/macro theme (AI capex, energy transition, defense, healthcare innovation)
+    - Technical breakout from confirmed institutional accumulation base
+    Reject tickers with no identifiable catalyst.
+
+    ═══════════════════════════════════════════════════════════
+    STEP 6 — LEVEL SETTING AND PORTFOLIO CONSTRUCTION
+    ═══════════════════════════════════════════════════════════
+    Multi-timeframe bias (same thresholds as v2):
+      SHORT (1-3m): price vs sma_20/50, volume_ratio, range_20d
+      MEDIUM (3-6m): trend_structure, rrg_quadrant, composite_score
+      LONG (6-12m): weekly_trend_structure
+
+    BULLISH overall: long AND medium BULLISH; composite > -0.2
+    Reject if not clearly BULLISH.
+
+    Entry / Stop / TP:
+      Entry: at support or within 1% of last_close (pullback) / consolidation_high + 0.1×atr (breakout)
+      Stop: below 10-day swing low OR 2.0×atr — TIGHTER wins; max 2.5×atr
+      TP1 by holding period:
+        1-3m: nearer of (next resistance / high_52w) or (2.0×risk)
+        3-6m: nearer of (high_52w) or (2.5×risk)
+        6-12m: high_104w or analyst target or (3.0×risk)
+      TP2: 3.0×risk (1-3m) / 4.0×risk (3-6m) / 5.0×risk (6-12m)
+      MANDATORY: (TP1 − entry) / (entry − stop) ≥ 2.0 — if impossible, discard
+
+    EARNINGS-IN-PATH CHECK (P1.6):
+    After setting TP1 and TP2, check if the stock's own earnings fall inside the holding window:
+      - holding_period "1-3m" → check if 10 < earnings_in_days < 90
+      - holding_period "3-6m" → check if 10 < earnings_in_days < 180
+      - holding_period "6-12m" → check if 10 < earnings_in_days < 365
+    If earnings fall before TP1 is reached: set event_in_path: ["TP1", "TP2"]
+    If earnings fall between TP1 and TP2: set event_in_path: ["TP2"]
+    If no earnings in path: set event_in_path: []
+    This does NOT discard the setup but surfaces the binary event risk at each level.
+
+    Position sizing (buy_in_quantity):
+      If buying_power is provided: floor(buying_power × BETA_TARGET_AS_FLOAT
+        / (number_of_viable_tickers × buy_in_price))
+      Sector haircut: if another passing ticker is in the same sector, reduce quantity by 30%.
+      Correlation haircut (P2.8): if two or more passing tickers share the same
+        catalyst_type = "sector_theme" or "macro_driven" AND the same sector, they are
+        implicitly ≥0.7 correlated (same hyperscaler-capex bet, same macro trade, etc.).
+        Treat them as ONE slot for sizing: keep only the highest-Sharpe name at full size;
+        halve the rest. Do NOT accumulate 5 full positions in the same macro theme.
+      Minimum buy_in_quantity: 1
+
+    Quality discard gates:
+      - R:R < 2.0
+      - Sharpe < 0.4
+      - composite_score < -0.2
+      - beta_6_12m > 3.0
+      - volume_ratio_vs_20d < 0.5 on breakout day
+      - weekly_trend_structure = "price_below_20w_below_40w" (unless Confidence ≥ 9)
+      - Confidence < 8 (computed deterministically below)
+
+    {buying_power_line}
+
+    ═══════════════════════════════════════════════════════════
+    DETERMINISTIC CONFIDENCE SCORING (P1.5)
+    ═══════════════════════════════════════════════════════════
+    Confidence is NOT a judgement call. Sum the modifiers from a fixed base of 5:
+
+    BONUSES (+):
+      +2  setup_quality_grade = A
+      +1  setup_quality_grade = B
+      +1  rrg_quadrant = "leading"
+      +0.5 rrg_quadrant = "improving"
+      +1  alpha_quintile = 5 (top 20%)
+      +0.5 alpha_quintile = 4
+      +1  long AND medium timeframe BOTH BULLISH, weekly_trend_structure = "price_above_20w_above_40w"
+      +0.5 analyst trend_90d = "improving" AND price target upside > 20%
+      +0.5 volume_ratio_vs_20d ≥ 1.5 (confirming volume on setup day)
+
+    PENALTIES (−):
+      -1  composite_score < 0
+      -1  close_vs_sma200_pct > 30%
+      -2  close_vs_sma200_pct > 50%  (overrides the -1)
+      -1  earnings_date_source = "unknown"
+      -1  entry_timing = "wait_for_sector_print"
+      -1  event_in_path is non-empty (earnings inside holding window)
+
+    Round to nearest integer. Cap at 10. Floor at 0.
+    Tickers with final Confidence < 8 are DISCARDED.
+    Show your arithmetic in CONCLUSION: "Confidence: 5 base +2(A) +1(leading) -1(sma200>30%) = 7 → discard"
+
+    For each ticker, assess regime alignment independently:
+        ALIGNED    — the broad market regime benefits this specific stock's thesis
+        NEUTRAL    — regime neither helps nor hurts
+        MISALIGNED — regime works against this stock (e.g., momentum exhaustion in extended stock)
+    - If NO ticker passes all gates: output exactly: no opportunity
+    - Otherwise output one JSON object per passing ticker on its own line (no markdown):
+    {{
+      "ticker": "STRING",
+      "current_price": NUMBER,
+      "current_price_date": "STRING",
+      "buy_in_price": NUMBER,
+      "stop_loss": NUMBER,
+      "take_profit_1": NUMBER,
+      "take_profit_2": NUMBER,
+      "buy_in_quantity": INTEGER,
+      "Confidence": INTEGER (0-10),
+      "atr_14": NUMBER,
+      "sharpe_ratio": NUMBER,
+      "setup_quality_grade": "A" or "B",
+      "holding_period_estimate": "1-3m" or "3-6m" or "6-12m",
+      "regime": "{regime}",
+      "regime_alignment": "ALIGNED|NEUTRAL|MISALIGNED",
+      "catalyst_type": "earnings|guidance|sector_theme|analyst_upgrade|technical_breakout|macro_driven",
+      "alpha_score": NUMBER,
+      "earnings_in_days": NUMBER or null,
+      "earnings_date_source": "earnings_dates|calendar|unknown",
+      "entry_timing": "immediate|wait_for_sector_print|post_confirmation",
+      "thesis_earnings_dependent": true or false,
+      "correlated_earnings_event": "TICKER|DATE|THEME or null",
+      "event_in_path": [] or ["TP1", "TP2"] or ["TP2"],
+      "confidence_calculation": "5 base +X(...) -Y(...) = N"
+    }}
+
+    Hard constraints:
+    - stop_loss < buy_in_price < take_profit_1 < take_profit_2
+    - (take_profit_1 - buy_in_price) / (buy_in_price - stop_loss) >= 2.0
+    - Output ONLY the JSON object(s) or "no opportunity"
+
+    Tickers to analyze:
+    {", ".join(tickers)}
+    """.strip()
+
+    grounding_tool2 = types.Tool(google_search=types.GoogleSearch())
+    config2 = types.GenerateContentConfig(
+        tools=[grounding_tool2, get_current_ticker_data_v3, compute_ex_ante_sharpe],
+        tool_config=types.ToolConfig(include_server_side_tool_invocations=True),
+        temperature=0.1,
+        thinking_config=types.ThinkingConfig(thinking_level="high"),
+    )
+
+    resp2 = client.models.generate_content(
+        model="gemini-3.1-pro-preview",
+        contents=prompt2,
+        config=config2,
+    )
+
+    logger.info("v3 daily market analysis stage 2 completed, regime=%s", regime)
     return (resp2.text or "").strip()

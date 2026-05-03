@@ -196,7 +196,9 @@ class YFPriceHistorySummary:
     range_20d_high: Optional[float]
     range_20d_low: Optional[float]
     close_vs_20d_high_pct: Optional[float]
-    recent_bars_10d: Optional[str]   # 10 bars ≈ 2 trading weeks of OHLCV context
+    recent_bars_10d: Optional[str]          # 10 bars ≈ 2 trading weeks of OHLCV context
+    close_to_close_vol_14d_pct: Optional[float]  # 14-day realized daily σ of close returns (%)
+    return_14d_pct: Optional[float]         # 14-day total price return (%)
 
     @staticmethod
     def from_history(
@@ -209,16 +211,7 @@ class YFPriceHistorySummary:
     ) -> "YFPriceHistorySummary":
         if not isinstance(history, pd.DataFrame) or history.empty:
             return YFPriceHistorySummary(
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
+                None, None, None, None, None, None, None, None, None, None, None, None,
             )
 
         df = history.copy()
@@ -236,16 +229,7 @@ class YFPriceHistorySummary:
 
         if close_col is None or high_col is None or low_col is None:
             return YFPriceHistorySummary(
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
+                None, None, None, None, None, None, None, None, None, None, None, None,
             )
 
         close = pd.to_numeric(df[close_col], errors="coerce")
@@ -336,6 +320,19 @@ class YFPriceHistorySummary:
         except Exception:
             recent_bars_str = None
 
+        # 14-day realized close-to-close volatility and return
+        cc_vol_14d_pct = None
+        ret_14d_pct = None
+        try:
+            daily_ret = close.pct_change().dropna()
+            if len(daily_ret) >= 14:
+                cc_vol_14d_pct = _round_opt(daily_ret.tail(14).std() * 100.0, 4)
+            if len(close) > 14:
+                ret_14d_pct = _round_opt((float(close.iloc[-1]) / float(close.iloc[-15]) - 1.0) * 100.0, 2)
+        except Exception:
+            cc_vol_14d_pct = None
+            ret_14d_pct = None
+
         return YFPriceHistorySummary(
             last_close=last_close,
             atr_14=atr_14,
@@ -347,6 +344,8 @@ class YFPriceHistorySummary:
             range_20d_low=range_low,
             close_vs_20d_high_pct=close_vs_high_pct,
             recent_bars_10d=recent_bars_str,
+            close_to_close_vol_14d_pct=cc_vol_14d_pct,
+            return_14d_pct=ret_14d_pct,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -998,11 +997,12 @@ class YFEarningsEvent:
     - Accept multiple shapes (DataFrame/Series/dict-like/None) without raising.
     - Prefer explicit earnings dates (index-based) when available.
     - Fall back to calendar formats commonly returned by yfinance.
-    - Never crash the pipeline: returns (None, None) if unknown.
+    - Never crash the pipeline: returns (None, None, "unknown") if unknown.
     """
 
     earnings_date_iso: Optional[str]  # "YYYY-MM-DD"
     earnings_in_days: Optional[int]  # can be negative if already passed
+    earnings_date_source: Optional[str]  # "earnings_dates" | "calendar" | "unknown"
 
     @staticmethod
     def _to_timestamp_safe(x: Any) -> Optional[pd.Timestamp]:
@@ -1154,26 +1154,30 @@ class YFEarningsEvent:
 
         # 1) Preferred: earnings_dates
         dt = YFEarningsEvent._extract_from_earnings_dates(earnings_dates, today)
+        source = "earnings_dates" if dt is not None else None
 
         # 2) Fallback: calendar
         if dt is None:
             dt = YFEarningsEvent._extract_from_calendar(calendar)
+            if dt is not None:
+                source = "calendar"
 
         # Final normalize + compute
         if dt is None:
-            return YFEarningsEvent(None, None)
+            return YFEarningsEvent(None, None, "unknown")
 
         try:
             dt_norm = pd.Timestamp(dt).tz_localize(None).normalize()
         except Exception:
             dt_norm = YFEarningsEvent._to_timestamp_safe(dt)
             if dt_norm is None:
-                return YFEarningsEvent(None, None)
+                return YFEarningsEvent(None, None, "unknown")
             dt_norm = dt_norm.tz_localize(None).normalize()
 
         days = int((dt_norm - today).days)
         return YFEarningsEvent(
-            earnings_date_iso=str(dt_norm.date()), earnings_in_days=days
+            earnings_date_iso=str(dt_norm.date()), earnings_in_days=days,
+            earnings_date_source=source,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1360,19 +1364,6 @@ class YFAnalystSignal:
         return asdict(self)
 
 
-# -----------------------------
-# Example usage (you wire yfinance calls yourself):
-#   info_filtered = YFInfoFundamentals.from_yfinance_info(info).to_dict()
-#   fast_filtered = YFFastInfoSnapshot.from_yfinance_fast_info(fast_info).to_dict()
-#   price_history = YFPriceHistorySummary.from_history(history_df).to_dict()
-#   nav_discount = YFNavDiscountPremium.from_yfinance_info(info, fast_info).to_dict()
-#   corr = YFMarketCorrelation.from_histories(stock_hist, index_hist, index_ticker="^OMX").to_dict()
-#   earnings = YFEarningsEvent.from_calendar_or_earnings_dates(calendar, earnings_dates).to_dict()
-#   actions = YFCorporateActions.from_actions_dividends_splits(actions_df, dividends_series, splits_series).to_dict()
-#   analyst = YFAnalystSignal.from_recommendations(recs_df).to_dict()
-# -----------------------------
-
-
 import math as _math
 
 
@@ -1382,30 +1373,50 @@ def compute_ex_ante_sharpe(
     tp1: float,
     tp2: float,
     atr_14: float,
-    win_rate: float = 0.50,
+    realized_vol_pct: Optional[float] = None,
+    setup_grade: str = "B",
     risk_free_annual: float = 0.045,
 ) -> Optional[float]:
     """
     Ex-ante Sharpe ratio for a defined-risk LONG swing trade.
 
-    Expected return is probability-weighted using win_rate (default 50%).
-    Volatility is scaled from ATR over an estimated holding period
-    (days to TP1 at ~1 ATR/day pace).
+    Fixes vs original:
+    - win_rate driven by setup_grade (A=0.60, B=0.55) instead of hardcoded 0.50.
+    - avg_reward weighted 0.7×TP1 + 0.3×TP2 (TP1 is the primary trim, TP2 is aspirational).
+    - daily_vol from realized close-to-close σ when supplied, else ATR/1.35/entry
+      (ATR ≈ 1.35× close-to-close σ empirically).
+    - Degenerate stop guard: risk < 0.5×ATR means stop is inside noise band → None.
 
-    Returns None if inputs are invalid or degenerate.
+    Args:
+        realized_vol_pct: 14-day realized daily σ of close returns in %; from
+                          close_to_close_vol_14d_pct in [price_history] section.
+                          Pass 0 or omit to use ATR-derived estimate.
+        setup_grade: "A" (60% win rate) or "B" (55%); default "B".
     """
     try:
         risk = entry - stop_loss
-        avg_reward = ((tp1 - entry) + (tp2 - entry)) / 2.0
+        reward_tp1 = tp1 - entry
+        reward_tp2 = tp2 - entry
+        weighted_reward = 0.7 * reward_tp1 + 0.3 * reward_tp2
 
-        if risk <= 0 or avg_reward <= 0 or atr_14 <= 0 or entry <= 0:
+        if risk <= 0 or weighted_reward <= 0 or atr_14 <= 0 or entry <= 0:
             return None
 
-        expected_return_pct = (win_rate * avg_reward - (1.0 - win_rate) * risk) / entry
+        # Degenerate stop: inside ATR noise band — not a valid defined-risk setup
+        if risk < 0.5 * atr_14:
+            return None
 
-        daily_vol = atr_14 / entry
-        est_holding_days = max(1.0, (tp1 - entry) / atr_14)
+        win_rate = {"A": 0.60, "B": 0.55}.get(str(setup_grade).strip().upper(), 0.55)
+        expected_return_pct = (win_rate * weighted_reward - (1.0 - win_rate) * risk) / entry
 
+        # Prefer supplied realized vol; fall back to ATR-derived estimate
+        if realized_vol_pct and realized_vol_pct > 0:
+            daily_vol = realized_vol_pct / 100.0
+        else:
+            # ATR ≈ 1.35× close-to-close σ (empirical scaling for equity daily bars)
+            daily_vol = atr_14 / (entry * 1.35)
+
+        est_holding_days = max(1.0, reward_tp1 / atr_14)
         rf_period = (risk_free_annual / 252.0) * est_holding_days
         period_vol = daily_vol * _math.sqrt(est_holding_days)
 
@@ -1594,6 +1605,99 @@ class YFEnhancedFundamentals:
             dividend_yield_pct=_pct_to_float(_get(info, "dividendYield")),
             peg_ratio=_to_float(_get(info, "pegRatio")),
             price_to_book=_to_float(_get(info, "priceToBook")),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# ===========================
+# v3 additions — institutional factor scoring
+# ===========================
+
+
+@dataclass(frozen=True)
+class YFFactorScore:
+    """
+    Composite institutional factor score computed from fundamentals + relative strength.
+    Weights: value 25%, quality 35%, momentum 40%.
+    All sub-scores and alpha_score in [-1, +1].
+    alpha_quintile uses fixed market-norm thresholds (5 = top 20%).
+    """
+
+    value_score: Optional[float]
+    quality_score: Optional[float]
+    momentum_score: Optional[float]
+    alpha_score: Optional[float]
+    alpha_quintile: Optional[int]
+
+    @classmethod
+    def compute(
+        cls,
+        fundamentals: Dict[str, Any],
+        enhanced_fundamentals: Dict[str, Any],
+        momentum_composite: Optional[float],
+    ) -> "YFFactorScore":
+        # --- Value ---
+        val_comps: List[float] = []
+        fwd_pe = _to_float(fundamentals.get("forward_pe"))
+        if fwd_pe is not None and 0 < fwd_pe < 200:
+            val_comps.append(max(-1.0, min(1.0, (22.0 - fwd_pe) / 20.0)))
+        ptb = _to_float(enhanced_fundamentals.get("price_to_book"))
+        if ptb is not None and ptb > 0:
+            val_comps.append(max(-1.0, min(1.0, (3.5 - ptb) / 3.5)))
+        value_score = round(sum(val_comps) / len(val_comps), 3) if val_comps else None
+
+        # --- Quality ---
+        qual_comps: List[float] = []
+        roe = _to_float(enhanced_fundamentals.get("return_on_equity"))
+        if roe is not None:
+            qual_comps.append(max(-1.0, min(1.0, roe / 25.0)))
+        gm = _to_float(enhanced_fundamentals.get("gross_margins_pct"))
+        if gm is not None:
+            qual_comps.append(max(-1.0, min(1.0, (gm - 25.0) / 35.0)))
+        fcf = _to_float(enhanced_fundamentals.get("free_cashflow"))
+        if fcf is not None:
+            qual_comps.append(1.0 if fcf > 0 else -0.5)
+        peg = _to_float(enhanced_fundamentals.get("peg_ratio"))
+        if peg is not None and peg > 0:
+            qual_comps.append(max(-1.0, min(1.0, (2.5 - peg) / 2.5)))
+        quality_score = round(sum(qual_comps) / len(qual_comps), 3) if qual_comps else None
+
+        # --- Momentum (pass-through from relative strength composite) ---
+        momentum_score = round(momentum_composite, 3) if momentum_composite is not None else None
+
+        # --- Alpha composite ---
+        comps: List[tuple] = []
+        if value_score is not None:
+            comps.append((value_score, 0.25))
+        if quality_score is not None:
+            comps.append((quality_score, 0.35))
+        if momentum_score is not None:
+            comps.append((momentum_score, 0.40))
+
+        alpha_score = None
+        alpha_quintile = None
+        if comps:
+            tw = sum(w for _, w in comps)
+            alpha_score = round(max(-1.0, min(1.0, sum(s * w for s, w in comps) / tw)), 3)
+            if alpha_score > 0.40:
+                alpha_quintile = 5
+            elif alpha_score > 0.15:
+                alpha_quintile = 4
+            elif alpha_score > -0.15:
+                alpha_quintile = 3
+            elif alpha_score > -0.40:
+                alpha_quintile = 2
+            else:
+                alpha_quintile = 1
+
+        return cls(
+            value_score=value_score,
+            quality_score=quality_score,
+            momentum_score=momentum_score,
+            alpha_score=alpha_score,
+            alpha_quintile=alpha_quintile,
         )
 
     def to_dict(self) -> Dict[str, Any]:

@@ -1,220 +1,508 @@
 ANALYSIS COMMANDS — HOW THEY WORK AND HOW THEY DIFFER
 =======================================================
 
-COMMANDS
+COMMANDS (current defaults)
+-----------------------------
+  python main.py analyze-stock <query>     # institutional 6-step analysis (v3, default)
+  python main.py analyze-asset <query>     # same as above — alias for commodities/futures
+  python main.py <query>                   # shorthand, same as analyze-stock (v3)
+  python main.py daily-market-analysis     # institutional 6-step market scan (v3, default)
+
+  python main.py analyze-stock-v2 <query>  # v2: 1-12 month multi-timeframe analysis
+  python main.py analyze-stock-v1 <query>  # v1: original 30-180 day swing analysis
+  python main.py daily-market-analysis-v2  # v2: 1-12 month scan, grade A/B setups only
+  python main.py daily-market-analysis-v1  # v1: original 30-180 day scan
+
+  python main.py scheduler                 # continuous scheduler (uses v3 scan)
+
+"analyze-stock" and "analyze-asset" are aliases for the same underlying function.
+The difference in behaviour comes entirely from what instrument the query resolves
+to — the system detects whether it's an equity or a commodity future and adjusts
+automatically.
+
+
+=======================================================================
+V3 — INSTITUTIONAL 6-STEP FRAMEWORK (DEFAULT)
+=======================================================================
+
+Overview
 --------
-  python main.py analyze-stock <query>    # e.g. analyze-stock AMD
-  python main.py analyze-asset <query>    # e.g. analyze-asset gold
-  python main.py analyze-stock-v2 <query> # enhanced 1–12 month version
-  python main.py <query>                  # shorthand, same as analyze-stock
+v3 applies a systematic 6-step institutional analysis pipeline before
+recommending any trade. The idea is to replicate how a quantitative hedge fund
+desk filters ideas: start wide with macro conditions, narrow through sector
+rotation, filter ruthlessly on liquidity and factor scores, verify a real
+catalyst exists, then size the position correctly.
 
-NOTE: "analyze-stock" and "analyze-asset" are aliases for the exact same
-function (single_stock_analysis). The difference in behaviour comes entirely
-from what kind of instrument the query resolves to — a stock/ETF or a
-commodity future — and the system handles each path differently automatically.
+The two main commands still work the same way from the outside — you get a trade
+recommendation with entry, stop-loss, take-profit, and Sharpe ratio. But every
+recommendation now has to pass 6 explicit gates rather than going straight from
+"looks interesting" to a trade setup.
 
 
-HOW THE QUERY IS RESOLVED
+STEP 1 — MACRO REGIME CLASSIFICATION
+--------------------------------------
+Before looking at individual stocks, the system characterises the overall market
+environment. It fetches live cross-asset data via the get_macro_regime_data() tool:
+
+  VIX (^VIX)             — fear / risk-on gauge
+  US 10-Year yield (^TNX) — rates direction
+  US 3-Month yield (^IRX) — short-end rates; used to compute yield curve spread
+  DXY proxy (UUP ETF)    — US dollar strength
+  Gold (GC=F)            — safe-haven demand signal
+  S&P 500 (^GSPC)        — broad market reference
+  HYG (high yield ETF)   — credit risk appetite
+  LQD (investment grade ETF) — investment grade credit
+
+  Derived signals:
+    Yield curve spread = 10Y minus 3M yield. Negative = inverted = recession signal.
+    HYG/LQD ratio trend = credit spread proxy. Rising = risk-on, falling = risk-off.
+
+The AI classifies the regime into one of four states:
+
+  Early-Cycle   Spreads tightening, yield curve positive, VIX declining,
+                broad market participation. Most aggressive posture.
+                → Portfolio beta target: 1.1–1.3
+
+  Mid-Cycle     Stable growth, moderate rates, VIX 12–18, spreads stable.
+                Normal operating environment for swing trading.
+                → Portfolio beta target: 0.9–1.1
+
+  Late-Cycle    Yield curve flattening or inverted, spreads widening,
+                rotation toward defensives (staples, utilities, healthcare).
+                Selective exposure only.
+                → Portfolio beta target: 0.6–0.9
+
+  Risk-Off      VIX above 25, spreads wide, dollar strong, gold bid,
+                equity distribution patterns visible.
+                Minimal or zero new long exposure.
+                → Portfolio beta target: 0.0–0.5
+
+The regime label is carried through every subsequent step. It determines which
+sectors are considered, how aggressively positions are sized, and whether a
+stock's directional bias is "aligned" or "misaligned" with the environment.
+
+
+STEP 2 — SECTOR ROTATION AND CAPITAL FLOW
+-------------------------------------------
+The system computes relative strength metrics for all 11 SPDR sector ETFs versus
+SPY using the get_sector_rotation_data() tool. This runs the same multi-algorithm
+RS engine used for individual stocks:
+
+  Mansfield RS (52-week)       — how much the sector is outperforming vs its own trend
+  Rolling alpha (annualised %) — excess return above market beta exposure
+  RRG quadrant                 — Relative Rotation Graph position:
+                                   leading   (strong RS, accelerating momentum)
+                                   improving (weak RS but momentum picking up)
+                                   weakening (strong RS but momentum decelerating)
+                                   lagging   (weak RS and decelerating)
+  Composite RS score (-1 to +1) — weighted combination of all three signals
+  1-month and 3-month price momentum
+
+Sectors are then classified:
+
+  APPROVED   rrg_quadrant is "leading" or "improving" AND composite_score >= -0.05
+             These sectors have active institutional capital flows behind them.
+
+  REJECTED   rrg_quadrant is "lagging" AND composite_score < -0.10
+             Institutional money is exiting. Avoid new longs here.
+
+  NEUTRAL    Everything else — not a headwind but not a tailwind either.
+
+In Risk-Off regimes, Consumer Staples, Utilities, and Healthcare are automatically
+approved regardless of their RS score, because that's where capital rotates
+defensively.
+
+Only stocks from APPROVED (or NEUTRAL in some conditions) sectors advance to the
+next steps. Google Search is also used here to confirm institutional flow evidence
+and identify specific stock candidates within the approved sectors.
+
+
+STEP 3 — LIQUIDITY AND RELEVANCE FILTERING
+--------------------------------------------
+This is a hard binary gate. A stock is rejected immediately if any of the following
+apply — no exceptions, no overrides:
+
+  avg_volume_20d < 500,000 shares   — execution risk; cannot enter/exit cleanly
+  market_cap < $500,000,000         — microcap; prone to manipulation, thin float
+  last_price < $3.00                — penny stock territory
+  earnings_in_days between 0 and 7  — binary event risk; the setup is meaningless
+                                       if earnings arrive before the trade develops
+
+For single-asset analysis (analyze-stock) the volume threshold is relaxed to
+100,000 shares because the user may be explicitly requesting a smaller-cap name.
+
+These thresholds are not AI judgement calls — they are enforced before the AI
+evaluates anything else.
+
+
+STEP 4 — SYSTEMATIC FACTOR SCREENING
+--------------------------------------
+Stocks that clear liquidity are scored on three quantitative factors. This scoring
+runs in Python (YFFactorScore in helpers.py) from data already fetched for the ticker.
+
+  VALUE SCORE (-1 to +1)
+    Inputs: forward P/E, price-to-book ratio
+    Forward P/E of 22 scores neutral (0). Below 10 approaches +1 (cheap), above 40
+    approaches -1 (expensive). P/B of 3.5 scores neutral; below 1.5 is value territory,
+    above 7 is expensive relative to book.
+    Cheap doesn't mean good by itself — that's why value weight is only 25%.
+
+  QUALITY SCORE (-1 to +1)
+    Inputs: return on equity, gross margin %, free cash flow, PEG ratio
+    ROE of 25%+ approaches +1 (excellent capital efficiency). Negative ROE approaches -1.
+    Gross margins above 60% (software/platform economics) score high; below 15% score low.
+    Positive free cash flow scores +1; negative FCF scores -0.5.
+    PEG below 1.0 (cheap relative to growth) scores positively; above 3.5 scores negatively.
+    Quality gets 35% weight — the biggest single factor — because sustained price moves
+    require a business that can actually grow into its valuation.
+
+  MOMENTUM SCORE (-1 to +1)
+    This is the composite_score from the relative strength engine:
+      Mansfield RS 52-week (40% of composite)
+      Rolling annualised alpha (30% of composite)
+      RRG quadrant score: leading=+1, improving=+0.33, weakening=-0.33, lagging=-1 (30%)
+    Momentum gets 40% weight. Price is a voting machine in the short run — a stock
+    already outperforming its benchmark is more likely to continue doing so over a
+    30–180 day swing horizon than one that isn't.
+
+  ALPHA SCORE = 0.25 × value + 0.35 × quality + 0.40 × momentum
+
+  ALPHA QUINTILE (1–5) using fixed thresholds:
+    Q5 (top 20%)   alpha_score > +0.40
+    Q4             alpha_score > +0.15
+    Q3 (neutral)   alpha_score > -0.15
+    Q2             alpha_score > -0.40
+    Q1 (bottom 20%) alpha_score ≤ -0.40
+
+A stock advances if:
+  alpha_quintile >= 4   (top 40% overall), OR
+  momentum_score > 0.3 AND quality_score >= 0   (strong momentum with decent quality), OR
+  alpha_score > 0.1 AND rrg_quadrant = "leading"  (leading sector stock with positive alpha)
+
+A stock is rejected if alpha_quintile = 1 (bottom 20%) with no exceptional imminent catalyst.
+
+In the single-asset output, the factor score is also used to adjust CONFIDENCE:
+  alpha_quintile 5 → +1 to CONFIDENCE (capped at 10)
+  alpha_quintile <= 2 → -2 from CONFIDENCE
+
+For commodity futures (tickers ending in =F), factor scoring is skipped since
+fundamentals and relative strength vs an index are not available.
+
+
+STEP 5 — FUNDAMENTAL CATALYST VERIFICATION
+--------------------------------------------
+A quantitatively strong stock that has no reason to move is just a coin flip.
+Step 5 requires identifying the specific event or condition that will force the
+market to re-price the asset within the 30–180 day swing window.
+
+The system looks for at least ONE of:
+
+  earnings          Two or more consecutive earnings beats with accelerating
+                    EPS/revenue growth. Next report must be more than 7 days away.
+                    The thesis is that institutional money builds positions ahead
+                    of expected continuation, not during the report.
+
+  guidance          Forward guidance revisions — management raising annual revenue
+                    or margin targets drives multiple expansion faster than earnings
+                    alone. This is identified from analyst_signal trend data and
+                    search context.
+
+  sector_theme      AI infrastructure spend, energy transition, defence buildout,
+                    healthcare innovation — macro themes that create multi-quarter
+                    tailwinds for entire subsectors. A stock in the right sector
+                    with the right exposure benefits even without company-specific
+                    news.
+
+  analyst_upgrade   An improving analyst upgrade cycle (trend_90d = "improving")
+                    with analyst price targets implying more than 20% upside from
+                    current price. The crowd of analysts upgrading together moves
+                    institutional money in size.
+
+  technical_breakout Confirmed institutional accumulation in a base pattern —
+                    multiple weeks/months of tight price action with high volume
+                    on up days and low volume on down days, followed by a breakout.
+                    Price action itself is the signal; fundamentals confirm it.
+
+  macro_driven      For assets where macro forces dominate (commodities, rate-
+                    sensitive sectors, currency-linked plays). The catalyst is
+                    external to the company — rate decisions, policy shifts,
+                    supply/demand data.
+
+Stocks with no identifiable catalyst are rejected at this step even if they pass
+all quantitative screens. A setup without a catalyst is a bet on random noise.
+
+
+STEP 6 — LEVEL SETTING AND PORTFOLIO CONSTRUCTION
+---------------------------------------------------
+This step produces the actual trade parameters. It combines v2's multi-timeframe
+methodology with the regime context and factor scores established in steps 1–5.
+
+  MULTI-TIMEFRAME TREND ASSESSMENT
+
+    Short-term (1-3 months) — evaluated on the daily chart:
+      BULLISH: price near the 20-day high, above both SMA20 and SMA50,
+               recent bars showing higher closes, volume ratio >= 0.8
+      BEARISH: price near the 20-day low, below SMA20, declining closes
+      MIXED:   conflicting or insufficient signals
+
+    Medium-term (3-6 months) — evaluated on 50/200-day MA and RRG:
+      BULLISH: trend_structure = "price_above_50_above_200" AND rrg_quadrant
+               "leading" or "improving" AND composite_score >= 0
+      BEARISH: price below both moving averages, rrg_quadrant "lagging",
+               composite_score < -0.2
+      MIXED:   otherwise
+
+    Long-term (6-12 months) — WEEKLY CHART IS PRIMARY:
+      BULLISH: weekly_trend_structure = "price_above_20w_above_40w"
+               (price above both the 20-week and 40-week MA)
+      MIXED:   one MA above, one below
+      BEARISH: "price_below_20w_below_40w"
+               A stock below its 40-week MA needs an exceptional catalyst and
+               strong fundamentals to qualify — otherwise it is rejected.
+
+    OVERALL BIAS weighting:
+      50% — long-term and medium-term trend (the macro and sector direction)
+      30% — fundamental quality and relative strength signals
+      20% — short-term daily setup
+
+    BULLISH overall:  long AND medium timeframe both BULLISH,
+                      composite_score > -0.2, no earnings within 7 days
+    BEARISH overall:  long OR medium timeframe BEARISH with no compelling recovery
+    UNSURE:           conflicting timeframes, weak fundamentals across all signals,
+                      failed liquidity gate, or insufficient data
+
+  ENTRY LEVELS
+
+    Pullback setup:
+      ENTRY_AGGRESSIVE  — at or just above the nearest technical support level,
+                          within 1% of last close. This is the primary recommendation.
+      ENTRY_CONSERVATIVE — above a clearly defined trigger: the 20-day range high,
+                           a consolidation resistance, or a prior breakout level.
+
+    Breakout setup:
+      ENTRY_AGGRESSIVE  — consolidation high + (0.1 × ATR_14) as a small buffer
+                          above resistance to avoid false breakouts.
+      ENTRY_CONSERVATIVE — after a confirmed close above the resistance level.
+
+    ENTRY_LEVEL in the output always refers to ENTRY_AGGRESSIVE (the primary number
+    used for Sharpe calculation and position sizing).
+
+  STOP-LOSS METHODOLOGY
+
+    The stop is placed at the TIGHTER of these two levels:
+      Below the most recent 10-day swing low (the last meaningful price structure
+      that would be broken if the thesis is wrong), OR
+      2.0 × ATR_14 below entry (a volatility-normalised distance that keeps the
+      stop from being too tight relative to normal daily fluctuation)
+
+    Absolute constraints:
+      Minimum: 0.5 × ATR_14 below entry (prevents stops that snap on noise)
+      Maximum: 2.5 × ATR_14 below entry (prevents stops so wide the trade doesn't work)
+
+    For 6-12 month setups, the 52-week low from the weekly structure is also used
+    as an absolute floor backstop — the stop cannot be placed below a level that
+    would still be above the yearly low in a structurally broken chart.
+
+    The stop is NOT a round number. It is not 5% below entry. It represents a
+    specific technical level whose breach means the original thesis is wrong.
+
+  TAKE-PROFIT METHODOLOGY
+
+    Take-profits are scaled to the estimated holding period, which is determined by
+    the setup type:
+      breakout / momentum_continuation → 1-3 months
+      pullback_to_support with large target → 3-6 months
+      base or reversal → 3-6 months or 6-12 months
+      If long-term trend is BULLISH and TP2 >= 4× risk distance → 6-12 months
+
+    TP1 (first target — where you trim the position):
+      1-3 month setups:  nearer of (next significant resistance / 52w high) or (2.0 × risk)
+      3-6 month setups:  nearer of (52-week high area) or (2.5 × risk)
+      6-12 month setups: 2-year high, analyst price target, or (3.0 × risk)
+
+    TP2 (second target — full exit / trail stop):
+      1-3 month setups:  3.0 × risk above entry
+      3-6 month setups:  4.0 × risk above entry
+      6-12 month setups: 5.0 × risk above entry
+
+    MANDATORY constraint: (TP1 − entry) / (entry − stop) >= 2.0
+    This means the expected gain to TP1 must be at least twice the risk.
+    If this 2:1 reward-to-risk ratio cannot be achieved with real technical levels,
+    BIAS is forced to UNSURE and no levels are output.
+
+    For short setups, all levels are mirrored: stop above entry, targets below.
+
+  POSITION SIZING (daily market scan only)
+
+    When buying power is provided, position size is computed as:
+      buy_in_quantity = floor(buying_power × beta_target / (n_viable × buy_in_price))
+
+    Where:
+      beta_target   = the portfolio beta target from Step 1 (e.g. 1.0 for Mid-Cycle)
+      n_viable      = number of tickers that pass all filters in this scan
+      buy_in_price  = entry level
+
+    If two passing tickers are in the same sector, the second one's quantity is
+    reduced by 30% to limit sector concentration risk.
+
+  EX-ANTE SHARPE RATIO
+
+    After setting levels, the system calls compute_ex_ante_sharpe() to score the
+    trade's risk-adjusted expected return before entering.
+
+    Formula:
+      risk          = entry − stop_loss
+      avg_reward    = ((TP1 − entry) + (TP2 − entry)) / 2
+      expected_pct  = (0.5 × avg_reward − 0.5 × risk) / entry   [assumes 50% win rate]
+      daily_vol     = ATR_14 / entry
+      est_hold_days = (TP1 − entry) / ATR_14   [days at ~1 ATR/day pace]
+      period_vol    = daily_vol × sqrt(est_hold_days)
+      rf_period     = (4.5% / 252) × est_hold_days
+      sharpe        = (expected_pct − rf_period) / period_vol
+
+    Minimum threshold: Sharpe >= 0.4 to pass the quality filter.
+    A setup with a great R:R ratio can still fail here if the holding period is
+    very long relative to the ATR (the volatility drag is too high).
+
+
+HOW CONFIDENCE IS SCORED
 --------------------------
-Step 1 — built-in alias table (assets only)
-  Before hitting Gemini, the system checks KNOWN_SINGLE_INSTRUMENT_ALIASES
-  in AI_calls.py. This table maps ~40 commodity/asset names to hard-coded
-  Yahoo Finance futures tickers and provides curated context:
+Confidence is an integer from 1-10 assigned by the AI, not computed by a formula.
+It represents conviction in the overall setup quality. However, the prompt gives
+the AI specific rules that make it systematic:
 
-    "gold"        → GC=F (Gold Futures)
-    "silver"      → SI=F (Silver Futures)
-    "brent"       → BZ=F (Brent Crude)
-    "crude oil"   → CL=F (WTI Crude)
-    "natural gas" → NG=F (Henry Hub Natural Gas)
-    "copper"      → HG=F (Copper Futures)
+  Starting point:
+    The AI builds confidence from the weight of evidence — how many of the following
+    are aligned vs conflicting.
 
-  Each alias entry includes a pre-written SEARCH_SUMMARY, RECENT_CATALYSTS,
-  and KEY_RISKS used directly in the analysis — no live web search needed.
+  Signals that push confidence UP:
+    All three timeframes BULLISH                        (strong structural alignment)
+    alpha_quintile = 5                                  (+1 point, capped at 10)
+    rrg_quadrant "leading" with composite_score > 0.3  (strong institutional flow)
+    Analyst upgrade cycle improving with >20% upside   (institutional consensus)
+    Named catalyst that is specific and near-term       (concrete reason to move)
+    Setup grade A (all criteria met cleanly)            (clean technical picture)
 
-Step 1 — Google Search fallback (stocks and unknown assets)
-  If the query doesn't match any alias, Gemini runs a Google Search to
-  identify the best Yahoo Finance-compatible ticker and returns:
-    TICKER, COMPANY, INSTRUMENT_TYPE, MATCH_CONFIDENCE,
-    SEARCH_SUMMARY, RECENT_CATALYSTS, KEY_RISKS
+  Signals that push confidence DOWN:
+    alpha_quintile <= 2                                 (-2 points)
+    Mixed timeframes (e.g. short BULLISH, long BEARISH) (no structural conviction)
+    Fundamental quality WEAK                            (-1 to -2 points)
+    Stock below 40-week MA                              (cap at 6)
+    Catalyst vague or no catalyst identified            (no known reason to move)
+    beta_6_12m > 2.0                                    (too noisy for a defined setup)
 
-  This step handles stocks, ETFs, indices, less common commodities, and
-  anything the user types in plain language ("nvidia", "s&p 500 etf", etc.).
+  Hard cap rules:
+    8 or above is only assigned when: long AND medium timeframe both BULLISH,
+    setup grade A or B, and a named catalyst is present. The AI is instructed
+    not to inflate confidence to cross the threshold.
 
+  Quality filter:
+    Confidence < 8 → trade is discarded in the daily scan.
+    Confidence < 8 → trade is still shown in single-asset analysis
+                     (the user asked for it; they can judge the number).
 
-DATA FETCHED — STOCKS vs ASSETS
----------------------------------
-After the ticker is resolved, the system calls get_current_ticker_data().
-The data path forks based on whether the ticker ends in "=F" (futures contract).
-
-  STOCKS / ETFs (e.g. AMD, SPY, AAPL)
-  ─────────────────────────────────────
-  All of the following are fetched from yfinance and passed to Gemini:
-
-  [fundamentals]
-    sector, industry, market_cap, beta, average_volume,
-    trailing_pe, forward_pe, profit_margins_pct,
-    revenue_growth_pct, earnings_growth_pct, debt_to_equity
-
-  [price_context]
-    last_price, previous_close, day_high, day_low,
-    year_high, year_low, currency, market_cap, shares_outstanding
-
-  [price_history]  — 3 months of daily bars
-    last_close, atr_14, atr_14_pct,
-    avg_volume_20d, last_volume, volume_ratio_vs_20d,
-    range_20d_high, range_20d_low, close_vs_20d_high_pct,
-    recent_bars_10d (last 10 daily OHLCV candles)
-
-  [moving_averages]  — computed from 1 year of daily history
-    sma_20, sma_50, sma_200,
-    close_vs_sma20_pct, close_vs_sma50_pct, close_vs_sma200_pct,
-    trend_structure (e.g. "price_above_50_above_200")
-
-  [market_correlation]  — vs the stock's exchange index (e.g. GSPC, IXIC, GDAXI)
-    index, correlation_6_12m, beta_6_12m, interpretation
-
-  [relative_strength]  — vs the same benchmark index
-    mrs_4w, mrs_13w, mrs_52w (Mansfield Relative Strength)
-    rolling_beta_63d, rolling_alpha_annualized_pct
-    rrg_rs_ratio, rrg_rs_momentum, rrg_quadrant
-    composite_score (-1 to +1), signal
-
-  [earnings_event]
-    earnings_date_iso, earnings_in_days
-
-  [analyst_signal]
-    latest_firm, latest_action_iso, trend_90d, rating_buckets
-
-  [analyst_price_targets]
-    mean, low, high, median targets from Wall Street analysts
-
-  [nav_discount]  — only meaningful for ETFs or closed-end funds
-    nav_price, market_price, nav_discount_premium_pct
+  Setup quality grade (separate from Confidence):
+    A — all three timeframes BULLISH, clean technical setup, STRONG fundamentals,
+        named catalyst, composite_score >= 0.3
+    B — long + medium BULLISH, at least one condition mixed, ADEQUATE fundamentals,
+        catalyst identifiable
+    C — daily-only setup, weekly neutral or mixed → discarded in the market scan
+    D — conflicting signals or WEAK fundamentals → forces BIAS = UNSURE
 
 
-  COMMODITY FUTURES (e.g. GC=F, BZ=F, NG=F)
-  ────────────────────────────────────────────
-  Futures tickers (ending in "=F") take a price-history-only path.
-  The following are NOT fetched:
+WHAT GETS SHOWN IN THE OUTPUT
+-------------------------------
+Single-asset analysis (analyze-stock) outputs three sections:
 
-    ✗ fundamentals (no PE, no earnings, no sector, no market cap)
-    ✗ market_correlation (no exchange → no benchmark index)
-    ✗ relative_strength (no benchmark → no MRS, RRG, alpha)
-    ✗ earnings_event (commodities have no earnings calendar)
-    ✗ analyst_signal (no analyst recommendations)
-    ✗ analyst_price_targets (no price targets)
-    ✗ nav_discount (not applicable)
+  1. JSON block with all fields:
+     REGIME, REGIME_ALIGNMENT, SECTOR_STATUS, LIQUIDITY_GATE,
+     ALPHA_SCORE, ALPHA_QUINTILE, VALUE_SCORE, QUALITY_SCORE, MOMENTUM_SCORE,
+     CATALYST_TYPE, BIAS, TRADE_DIRECTION, CONFIDENCE, SETUP_QUALITY_GRADE,
+     SETUP_TYPE, SHARPE_RATIO, HOLDING_PERIOD_ESTIMATE,
+     CURRENT_PRICE, ENTRY_AGGRESSIVE, ENTRY_CONSERVATIVE, ENTRY_LEVEL,
+     STOP_LOSS_LEVEL, TAKE_PROFIT_1, TAKE_PROFIT_2,
+     TREND_SHORT_1M, TREND_MEDIUM_3_6M, TREND_LONG_6_12M,
+     THESIS, KEY_CATALYST, INVALIDATION_TRIGGER, LEVELS_RATIONALE, CONCLUSION
 
-  Only these sections are populated:
+  2. Institutional 6-Step Analysis table:
+     One row per step showing what the AI determined at each gate.
 
-  [price_context]
-    last_price, previous_close, day_high, day_low, year_high, year_low, currency
+  3. Timeframe Analysis table (short / medium / long trend bias)
 
-  [price_history]  — same 3-month window as equities
-    last_close, atr_14, atr_14_pct,
-    avg_volume_20d, last_volume, volume_ratio_vs_20d,
-    range_20d_high, range_20d_low, close_vs_20d_high_pct,
-    recent_bars_10d
+  4. Upside vs Downside summary table (5 concrete catalysts vs 5 concrete risks)
 
-  [moving_averages]  — same computation as equities
-    sma_20, sma_50, sma_200, trend_structure, close_vs_sma*_pct
+Daily market scan outputs JSON objects, one per viable opportunity, with all
+fields needed for automated bracket-order execution.
 
 
-BASIS OF THE AI DECISION
---------------------------
-In both cases Gemini uses extended thinking ("thinking_level=high") and runs
-a two-step analysis. The decision framework is identical, but the available
-evidence differs significantly.
+=======================================================================
+V2 — MULTI-TIMEFRAME SWING ANALYSIS
+=======================================================================
 
-  STOCKS
-  ──────
-  The AI weighs multiple data dimensions:
+v2 (analyze-stock-v2) was the previous default. It introduced weekly chart
+structure and enhanced fundamentals but lacked the macro regime and sector
+rotation layers. It is still available and useful for quick 1-12 month
+analysis without the additional API calls for macro/sector data.
 
-  1. Macro/news context     — from the Google Search step (recent catalysts,
-                              key risks, search summary)
-  2. Technical setup        — ATR-based levels, 20d range position, MA alignment,
-                              trend_structure (50/200 MA relationship)
-  3. Relative strength      — composite_score, rrg_quadrant, rolling_alpha
-                              (is this stock beating its market/sector?)
-  4. Market correlation     — beta and correlation to the exchange index
-                              (how much market risk does this carry?)
-  5. Fundamental quality    — PE ratios, revenue/earnings growth, profit margins,
-                              debt levels (is this a good business?)
-  6. Earnings risk          — earnings_in_days (avoids setups < 7 days from earnings)
-  7. Analyst momentum       — trend_90d, analyst price targets (soft signal)
+Key differences from v3:
+  No macro regime classification (no get_macro_regime_data call)
+  No sector rotation analysis (no get_sector_rotation_data call)
+  No factor score (no YFFactorScore — value/quality/momentum composite)
+  No liquidity gate (relies on AI judgement rather than hard thresholds)
+  No catalyst_type classification
+  Output lacks REGIME, SECTOR_STATUS, ALPHA_SCORE, LIQUIDITY_GATE fields
 
-  The AI determines BIAS (BULLISH / BEARISH / UNSURE) then sets entry, stop,
-  and two take-profit levels using ATR multiples and swing-high/low structures.
-  It also calls compute_ex_ante_sharpe() to score the trade's risk-adjusted
-  expected return.
+v2 data additions vs v1:
+  5-year weekly bars: sma_20w, sma_40w, weekly_trend_structure,
+  52-week and 2-year high/low, recent_bars_8w
+  Enhanced fundamentals: FCF, operating cashflow, gross/operating margins,
+  ROE, ROA, current ratio, dividend yield, PEG ratio, price-to-book
 
-  COMMODITY ASSETS
-  ─────────────────
-  Without fundamentals, earnings, correlation, or relative strength data,
-  the AI must work entirely from:
-
-  1. Curated context        — the pre-written SEARCH_SUMMARY, RECENT_CATALYSTS,
-                              and KEY_RISKS from KNOWN_SINGLE_INSTRUMENT_ALIASES
-                              (covers macro drivers: real yields, OPEC policy,
-                              weather, industrial demand, geopolitical risk, etc.)
-  2. Technical setup        — same ATR-based level methodology as stocks:
-                              atr_14, range position, MA alignment, trend_structure
-  3. Price momentum         — recent_bars_10d, volume_ratio, close_vs_20d_high_pct
-
-  The level-setting methodology is explicitly the same as for equities
-  (ATR multiples, swing-low stops, 2:1 R:R requirement). The prompt notes:
-  "For non-equity instruments: apply the same ATR-based methodology; do not
-  force earnings-style reasoning where it does not apply."
-
-  The Sharpe computation also runs the same way, using atr_14 as the
-  volatility input regardless of instrument type.
+v2 framework additions vs v1:
+  Multi-timeframe bias (short / medium / long)
+  Fundamental quality grade: STRONG / ADEQUATE / WEAK / UNKNOWN
+  Setup quality grade: A / B / C / D
+  Two entry variants: ENTRY_AGGRESSIVE and ENTRY_CONSERVATIVE
+  THESIS, KEY_CATALYST, INVALIDATION_TRIGGER
+  Holding period estimate: 1-3m, 3-6m, 6-12m
+  TP2 multipliers scaled to holding period (3× / 4× / 5×)
 
 
-SUMMARY TABLE
---------------
-  Feature                    analyze-stock    analyze-asset (future)
-  ─────────────────────────────────────────────────────────────────
-  Ticker resolution          Google Search    Built-in alias table (preferred)
-                             or alias         → Google Search as fallback
-  Fundamentals               Yes              No
-  Earnings date / risk       Yes              No
-  Analyst ratings/targets    Yes              No
-  Relative strength vs index Yes              No
-  Market correlation / beta  Yes              No
-  Price history + ATR        Yes              Yes
-  Moving averages            Yes              Yes
-  Curated macro context      From search      Pre-written in alias table
-  Sharpe ratio calculation   Yes              Yes
-  ATR-based level setting    Yes              Yes
+=======================================================================
+V1 — ORIGINAL SWING ANALYSIS
+=======================================================================
+
+v1 (analyze-stock-v1, daily-market-analysis-v1) is the original implementation.
+It fetches daily price history (3 months), moving averages (1 year), fundamentals,
+relative strength vs exchange index, earnings calendar, and analyst recommendations.
+
+Framework: single-pass bias determination → ATR-based levels → 2:1 R:R filter
+→ Sharpe calculation. No multi-timeframe assessment. No weekly chart. No factor
+scoring. No macro/sector context.
+
+v1 is the fastest of the three and produces results with fewer API round-trips.
+It is most appropriate for quick directional checks on stocks you already know.
 
 
-ANALYZE-STOCK-V2
------------------
-analyze-stock-v2 is a different command that calls single_stock_analysis_v2(),
-which uses a richer data fetch (get_current_ticker_data_v2) and a more
-detailed analytical framework. Key additions vs v1:
+=======================================================================
+DATA AVAILABILITY BY INSTRUMENT TYPE
+=======================================================================
 
-  Data additions:
-    - 5 years of weekly bars: sma_20w (≈100d MA), sma_40w (≈200d MA),
-      weekly_trend_structure, 52-week and 2-year high/low ranges,
-      recent_bars_8w (8 weekly OHLCV candles)
-    - Enhanced fundamentals (equities only): free_cashflow, operating_cashflow,
-      gross_margins_pct, operating_margins_pct, return_on_equity,
-      return_on_assets, current_ratio, dividend_yield_pct, peg_ratio,
-      price_to_book
-
-  Framework additions:
-    - Multi-timeframe bias: SHORT (1-3m daily), MEDIUM (3-6m daily),
-      LONG (6-12m weekly chart is primary)
-    - Fundamental quality grade: STRONG / ADEQUATE / WEAK / UNKNOWN
-      (adjusts CONFIDENCE score up or down)
-    - Setup quality grade: A / B / C / D
-    - Setup type classification: breakout, pullback_to_support, base,
-      momentum_continuation, reversal, unsure
-    - Two entry variants: ENTRY_AGGRESSIVE and ENTRY_CONSERVATIVE
-    - THESIS, KEY_CATALYST, INVALIDATION_TRIGGER fields
-    - HOLDING_PERIOD_ESTIMATE: 1-3m, 3-6m, or 6-12m
-    - Larger TP2 multipliers scaled to the holding period
-
-  v2 is slower (fetches more data) and suited for longer conviction trades.
-  v1 (analyze-stock / analyze-asset) is the default for quick swing setups.
+Feature                          Stocks/ETFs    Commodity Futures (=F)
+────────────────────────────────────────────────────────────────────────
+Macro regime (Step 1)            Yes            Yes (affects alignment label)
+Sector rotation (Step 2)         Yes            n/a (no sector ETF mapping)
+Liquidity gate (Step 3)          Yes            Relaxed (volume only)
+Factor score (Step 4)            Yes            No (skipped, n/a in output)
+Catalyst identification (Step 5) Yes            Yes (macro-driven category)
+Level setting (Step 6)           Yes            Yes (same ATR methodology)
+Fundamentals                     Yes            No
+Earnings date/risk               Yes            No
+Analyst ratings/targets          Yes            No
+Relative strength vs index       Yes            No
+Market correlation/beta          Yes            No
+Weekly chart structure           Yes (v2/v3)    No
+Enhanced fundamentals            Yes (v2/v3)    No
+Price history + ATR              Yes            Yes
+Moving averages                  Yes            Yes
+Sharpe ratio calculation         Yes            Yes
