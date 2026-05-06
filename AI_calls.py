@@ -233,6 +233,53 @@ def _uses_price_history_only_market_data(ticker: str) -> bool:
     return normalized_ticker.endswith("=F")
 
 
+def _get_extended_hours_price(
+    data: yf.Ticker,
+    info: dict,
+) -> tuple[str | None, float | None]:
+    """
+    Return (market_state, extended_hours_price) when the market is not in a
+    REGULAR session, otherwise (market_state, None).
+
+    market_state is one of: "PRE", "POST", "CLOSED", "REGULAR", or None.
+    Extended-hours price is taken from the last bar of a 2-minute intraday
+    history fetched with prepost=True, which is the most reliable source.
+    Falls back to preMarketPrice / postMarketPrice from the info dict.
+    """
+    market_state: str | None = info.get("marketState")
+    if market_state == "REGULAR":
+        return market_state, None
+
+    eh_price: float | None = None
+
+    # Primary: last 2-minute bar with pre/post flag (actual traded prices)
+    try:
+        hist = data.history(period="1d", interval="2m", prepost=True)
+        if hist is not None and not hist.empty:
+            close_col = "Close" if "Close" in hist.columns else None
+            if close_col:
+                val = float(hist[close_col].dropna().iloc[-1])
+                if val > 0:
+                    eh_price = round(val, 4)
+    except Exception:
+        pass
+
+    # Fallback: info dict fields (often cached/stale but better than nothing)
+    if eh_price is None:
+        for key in ("preMarketPrice", "postMarketPrice"):
+            candidate = info.get(key)
+            if candidate is not None:
+                try:
+                    val = float(candidate)
+                    if val > 0:
+                        eh_price = round(val, 4)
+                        break
+                except Exception:
+                    pass
+
+    return market_state, eh_price
+
+
 def _safe_fast_info_subset(data: yf.Ticker, *, include_equity_fields: bool) -> dict:
     try:
         fast_info = data.fast_info or {}
@@ -408,6 +455,27 @@ def get_current_ticker_data(ticker: str) -> str:
     pc = fast_info.get("previous_close")
     if lp is not None and pc is not None and abs(float(lp) - float(pc)) < 1e-6:
         lines.append("price_staleness_warning: last_price equals previous_close — market may be closed or data stale")
+
+    # Extended-hours price context (PRE / POST / CLOSED sessions only)
+    if not price_history_only:
+        try:
+            market_state, eh_price = _get_extended_hours_price(data, info)
+            if market_state is not None:
+                lines.append(f"market_status: {market_state}")
+            if eh_price is not None and pc is not None:
+                try:
+                    eh_vs_close_pct = round((eh_price / float(pc) - 1.0) * 100.0, 2)
+                    lines.append(f"extended_hours_price: {eh_price}")
+                    lines.append(f"extended_hours_vs_prev_close_pct: {eh_vs_close_pct:+.2f}%")
+                    lines.append(
+                        "extended_hours_note: Use extended_hours_price for gap/directional context only. "
+                        "All entry, stop, and target levels must be anchored to last_close / previous_close "
+                        "and ATR-based regular-session technicals — not to extended_hours_price."
+                    )
+                except Exception:
+                    lines.append(f"extended_hours_price: {eh_price}")
+        except Exception:
+            pass
 
     # P0.3 — Catalyst staleness: flag if price moved >2σ or earnings printed in last 14 days
     try:
@@ -889,6 +957,10 @@ def single_stock_analysis(stock_query: str, client) -> str:
 
     Step 5: Call compute_ex_ante_sharpe(entry, stop_loss, take_profit_1, take_profit_2, atr_14).
             Use the result as SHARPE_RATIO. If BIAS is UNSURE, set SHARPE_RATIO to UNSURE.
+
+    Extended-hours note: If the tool result contains extended_hours_price, use it only as directional
+    context (e.g., noting a gap vs. previous close). All entry, stop, and target levels MUST be
+    anchored to last_close / previous_close and ATR-based regular-session technicals.
 
     UPSIDE fields: each must be one specific, concrete catalyst or condition that would push price
                    higher (e.g., "earnings beat triggers analyst upgrades", "breakout above $X resistance").
